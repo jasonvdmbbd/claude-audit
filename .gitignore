@@ -1,0 +1,6 @@
+# Local Claude Code workspace state and REAL audit data — never publish
+.claude/
+**/.claude/
+*.db-wal
+*.db-shm
+.DS_Store

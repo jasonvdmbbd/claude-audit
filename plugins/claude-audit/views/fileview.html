@@ -1,0 +1,747 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Artifact — Claude Audit</title>
+
+<!--
+  The artifact renderer, opened as /view?path=<absolute path>.
+
+  It never reads the filesystem itself: every byte comes from the service's
+  /api/file, which serves a path only when that path canonicalises to
+  somewhere inside a workspace the audit database has recorded.
+
+  Three renderers, chosen by extension:
+    .html/.htm       the page actually RUNS, inside a sandboxed iframe whose
+                     src is /api/file -- so relative fetches inside it resolve
+                     against /api/ and fail closed.
+    .md/.markdown    marked -> DOMPurify.sanitize -> a styled article.
+    everything else  highlight.js with a line-number gutter.
+
+  Inside the markdown renderer, ```mermaid fences are drawn as diagrams:
+  mermaid is fetched lazily from the same CDN the first time a fence appears,
+  runs with securityLevel "strict" and no HTML labels, and its SVG is passed
+  through DOMPurify before it reaches the page. A library that will not load,
+  or a diagram that will not parse, leaves the code block exactly as it was.
+
+  Untrusted text (paths, file contents, error messages) is written with
+  textContent. The only two exceptions are deliberate and isolated: the
+  DOMPurify-sanitized markdown container (which the mermaid SVG also goes
+  through), and the sandboxed iframe.
+-->
+
+<link rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css"
+      media="(prefers-color-scheme: light)">
+<link rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css"
+      media="(prefers-color-scheme: dark)">
+
+<style>
+:root {
+  color-scheme: light dark;
+
+  --bg:            #f6f7f9;
+  --bg-elev:       #ffffff;
+  --bg-sunken:     #eef0f4;
+  --bg-code:       #f3f4f7;
+  --border:        #dcdfe6;
+  --border-strong: #c3c8d2;
+  --text:          #14171f;
+  --text-dim:      #5c6473;
+  --text-faint:    #868e9d;
+  --accent:        #3a5bd9;
+  --accent-soft:   #e7ecfd;
+  --danger:        #c0392b;
+  --danger-soft:   #fdecea;
+
+  --radius: 8px;
+  --radius-sm: 5px;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif,
+          "Apple Color Emoji", "Segoe UI Emoji";
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg:            #0f1116;
+    --bg-elev:       #171a21;
+    --bg-sunken:     #12141a;
+    --bg-code:       #1b1f28;
+    --border:        #2a2f3a;
+    --border-strong: #3a414f;
+    --text:          #e6e9ef;
+    --text-dim:      #9aa3b2;
+    --text-faint:    #6f7887;
+    --accent:        #7d95f5;
+    --accent-soft:   #1d2540;
+    --danger:        #f2776a;
+    --danger-soft:   #2e1a18;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg:            #0f1116;
+  --bg-elev:       #171a21;
+  --bg-sunken:     #12141a;
+  --bg-code:       #1b1f28;
+  --border:        #2a2f3a;
+  --border-strong: #3a414f;
+  --text:          #e6e9ef;
+  --text-dim:      #9aa3b2;
+  --text-faint:    #6f7887;
+  --accent:        #7d95f5;
+  --accent-soft:   #1d2540;
+  --danger:        #f2776a;
+  --danger-soft:   #2e1a18;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+html { background: var(--bg); }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  display: flex;
+  flex-direction: column;
+}
+
+a { color: var(--accent); }
+
+/* ---- header ---------------------------------------------------------- */
+
+header {
+  flex: 0 0 auto;
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border);
+  padding: 10px 16px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 14px;
+}
+
+.home {
+  font-weight: 600; font-size: 13px; text-decoration: none;
+  color: var(--text-dim); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 4px 9px; background: var(--bg-elev);
+}
+.home:hover { background: var(--bg-sunken); }
+
+.pathwrap { min-width: 0; flex: 1 1 320px; }
+#path {
+  font-family: var(--mono); font-size: 13px; color: var(--text);
+  overflow-wrap: anywhere; word-break: break-all;
+}
+#meta { font-size: 12px; color: var(--text-faint); margin-top: 2px; }
+#meta .sep { opacity: .5; padding: 0 5px; }
+
+.seg { display: inline-flex; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); overflow: hidden; }
+.seg button {
+  border: 0; padding: 5px 13px; font: inherit; font-size: 13px; cursor: pointer;
+  background: var(--bg-elev); color: var(--text-dim);
+}
+.seg button + button { border-left: 1px solid var(--border-strong); }
+.seg button:hover { background: var(--bg-sunken); }
+.seg button.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.seg[hidden] { display: none; }
+
+.raw {
+  font-size: 13px; text-decoration: none; color: var(--text-dim);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 4px 9px; background: var(--bg-elev);
+}
+.raw:hover { background: var(--bg-sunken); }
+
+/* ---- body ------------------------------------------------------------ */
+
+main { flex: 1 1 auto; min-height: 0; position: relative; overflow: auto; }
+.pane { display: none; }
+.pane.on { display: block; }
+#pane-rendered.on, #pane-frame.on { display: block; }
+
+#frame {
+  display: block; width: 100%; height: 100%;
+  border: 0; background: #fff;
+}
+#pane-frame { position: absolute; inset: 0; }
+#pane-frame.on { display: block; }
+
+.notice {
+  margin: 24px auto; max-width: 720px; padding: 18px 20px;
+  background: var(--bg-elev); border: 1px solid var(--border);
+  border-radius: var(--radius); color: var(--text-dim);
+}
+.notice.error { border-color: var(--danger); background: var(--danger-soft); color: var(--danger); }
+.notice h2 { margin: 0 0 6px; font-size: 15px; color: var(--text); }
+.notice.error h2 { color: var(--danger); }
+.notice code { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+
+/* ---- code with a line-number gutter ---------------------------------- */
+
+.codewrap {
+  display: flex; align-items: stretch;
+  font-family: var(--mono); font-size: 12.5px; line-height: 1.55;
+  background: var(--bg-code);
+  border-top: 1px solid var(--border);
+  min-height: 100%;
+}
+.gutter {
+  flex: 0 0 auto; margin: 0; padding: 14px 10px 14px 16px;
+  text-align: right; color: var(--text-faint);
+  background: var(--bg-sunken); border-right: 1px solid var(--border);
+  position: sticky; left: 0; z-index: 1;
+  font: inherit; user-select: none; white-space: pre;
+}
+.codewrap pre.code {
+  flex: 1 1 auto; margin: 0; padding: 14px 16px;
+  white-space: pre; font: inherit; overflow: visible;
+}
+.codewrap pre.code code { font: inherit; background: none; padding: 0; }
+.codewrap code.hljs { background: transparent; padding: 0; }
+
+/* ---- rendered markdown ----------------------------------------------- */
+
+#doc {
+  max-width: 860px; margin: 0 auto; padding: 32px 24px 80px;
+  font-size: 15px; line-height: 1.65; color: var(--text);
+}
+#doc h1, #doc h2, #doc h3, #doc h4 { line-height: 1.25; margin: 1.6em 0 .6em; font-weight: 650; }
+#doc h1 { font-size: 1.9em; margin-top: .2em; }
+#doc h2 { font-size: 1.45em; border-bottom: 1px solid var(--border); padding-bottom: .25em; }
+#doc h3 { font-size: 1.2em; }
+#doc p, #doc ul, #doc ol, #doc blockquote, #doc table { margin: 0 0 1em; }
+#doc li { margin: .25em 0; }
+#doc blockquote {
+  border-left: 3px solid var(--border-strong); margin-left: 0;
+  padding: .2em 0 .2em 1em; color: var(--text-dim);
+}
+#doc code {
+  font-family: var(--mono); font-size: .88em;
+  background: var(--bg-code); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: .1em .35em;
+}
+#doc pre {
+  background: var(--bg-code); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 12px 14px; overflow-x: auto;
+}
+#doc pre code { background: none; border: 0; padding: 0; font-size: 12.5px; }
+#doc table { border-collapse: collapse; width: 100%; font-size: .95em; }
+#doc th, #doc td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
+#doc th { background: var(--bg-sunken); font-weight: 600; }
+#doc img { max-width: 100%; height: auto; }
+#doc hr { border: 0; border-top: 1px solid var(--border); margin: 2em 0; }
+#doc a { overflow-wrap: anywhere; }
+
+/* ---- mermaid ----------------------------------------------------------
+   A ```mermaid fence becomes a diagram; the fenced source stays underneath,
+   hidden, and comes back if the diagram cannot be drawn. */
+.hidden { display: none !important; }
+#doc .mmd { margin: 0 0 1em; }
+#doc .mmd-svg { overflow-x: auto; }
+#doc .mmd-svg svg { max-width: 100%; height: auto; display: block; margin: 0 auto; }
+#doc .mmd > pre { margin: 0; }
+
+/* ---- image ----------------------------------------------------------- */
+
+#pane-image { padding: 24px; text-align: center; }
+#pane-image img {
+  max-width: 100%; border: 1px solid var(--border);
+  border-radius: var(--radius); background: var(--bg-elev);
+}
+</style>
+</head>
+<body>
+
+<header>
+  <a class="home" href="/" title="Back to the audit viewer">&#8592; Audit</a>
+  <div class="pathwrap">
+    <div id="path">&nbsp;</div>
+    <div id="meta"></div>
+  </div>
+  <div class="seg" id="toggle" hidden>
+    <button type="button" id="btn-rendered" class="on">Rendered</button>
+    <button type="button" id="btn-source">Source</button>
+  </div>
+  <a class="raw" id="raw" href="#" target="_blank" rel="noopener noreferrer">Raw</a>
+</header>
+
+<main>
+  <div class="pane" id="pane-status">
+    <div class="notice" id="status"><h2>Loading</h2><span id="status-text">Fetching file…</span></div>
+  </div>
+  <div class="pane" id="pane-frame"><iframe id="frame" sandbox="allow-scripts" title="Rendered HTML"></iframe></div>
+  <div class="pane" id="pane-doc"><article id="doc"></article></div>
+  <div class="pane" id="pane-code">
+    <div class="codewrap"><pre class="gutter" id="gutter"></pre><pre class="code"><code id="code"></code></pre></div>
+  </div>
+  <div class="pane" id="pane-image"><img id="image" alt=""></div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  function $(id) { return document.getElementById(id); }
+
+  var params = new URLSearchParams(window.location.search);
+  var filePath = params.get("path") || "";
+  var rawUrl = "/api/file?path=" + encodeURIComponent(filePath);
+
+  // ---- extension -> renderer ------------------------------------------
+
+  var IMAGE_EXT = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "avif"];
+  var MARKDOWN_EXT = ["md", "markdown", "mdown", "mkd"];
+  var HTML_EXT = ["html", "htm", "xhtml"];
+
+  // hljs language per extension. Anything not listed falls back to
+  // highlightAuto, which is right far more often than a wrong guess.
+  var LANG = {
+    js: "javascript", mjs: "javascript", cjs: "javascript", jsx: "javascript",
+    ts: "typescript", tsx: "typescript",
+    py: "python", rb: "ruby", go: "go", rs: "rust", java: "java",
+    c: "c", h: "c", cc: "cpp", cpp: "cpp", hpp: "cpp", cs: "csharp",
+    php: "php", swift: "swift", kt: "kotlin", scala: "scala", lua: "lua",
+    sh: "bash", bash: "bash", zsh: "bash", fish: "bash",
+    sql: "sql", json: "json", jsonl: "json", yaml: "yaml", yml: "yaml",
+    toml: "ini", ini: "ini", cfg: "ini", conf: "ini",
+    css: "css", scss: "scss", less: "less",
+    xml: "xml", svg: "xml", html: "xml", htm: "xml", vue: "xml",
+    md: "markdown", markdown: "markdown",
+    dockerfile: "dockerfile", makefile: "makefile", diff: "diff", patch: "diff"
+  };
+
+  function extensionOf(path) {
+    var name = String(path).split(/[\\/]/).pop() || "";
+    var dot = name.lastIndexOf(".");
+    if (dot <= 0) { return name.toLowerCase(); }   // Dockerfile, Makefile
+    return name.slice(dot + 1).toLowerCase();
+  }
+
+  function inList(value, list) { return list.indexOf(value) !== -1; }
+
+  function el(tag, cls) {
+    var n = document.createElement(tag);
+    if (cls) { n.className = cls; }
+    return n;
+  }
+
+  // ---- mermaid ---------------------------------------------------------
+  //
+  // The library is ~3MB, so — unlike marked/DOMPurify/highlight.js, which the
+  // page loads up front — it is fetched only the first time a document
+  // actually contains a ```mermaid fence. A file with no diagrams never pays
+  // for it, and a machine that cannot reach the CDN keeps the code block.
+  //
+  // File contents are untrusted, so the diagram source is too: securityLevel
+  // stays "strict" (mermaid sanitizes its own labels and refuses click
+  // directives), htmlLabels stays off so a label can never become live
+  // markup, and the SVG that comes back still goes through DOMPurify. That
+  // round-trip was checked against mermaid 11's output and is lossless —
+  // same viewBox, paths, markers and <style> — so DOMPurify stays the only
+  // place markup is parsed on this page.
+
+  var MERMAID_URL = "https://cdnjs.cloudflare.com/ajax/libs/mermaid/11.15.0/mermaid.min.js";
+  var mermaidLoad = null;   // Promise for the library, created on first use
+  var mermaidLive = [];     // drawn diagrams, kept so a theme flip can redraw
+  var mermaidSeq = 0;
+
+  function mermaidDark() {
+    var attr = document.documentElement.getAttribute("data-theme");
+    if (attr === "dark") { return true; }
+    if (attr === "light") { return false; }
+    try {
+      return !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+    } catch (err) { return false; }
+  }
+
+  function mermaidConfig() {
+    return {
+      startOnLoad: false,
+      securityLevel: "strict",
+      theme: mermaidDark() ? "dark" : "default",
+      htmlLabels: false,
+      flowchart: { htmlLabels: false },
+      class: { htmlLabels: false }
+    };
+  }
+
+  function loadMermaid() {
+    if (mermaidLoad) { return mermaidLoad; }
+    mermaidLoad = new Promise(function (resolve, reject) {
+      if (window.mermaid) { resolve(window.mermaid); return; }
+      var s = document.createElement("script");
+      s.src = MERMAID_URL;
+      s.async = true;
+      s.onload = function () {
+        if (window.mermaid) { resolve(window.mermaid); }
+        else { reject(new Error("mermaid loaded but registered nothing")); }
+      };
+      s.onerror = function () { reject(new Error("mermaid could not be fetched")); };
+      (document.head || document.documentElement).appendChild(s);
+    }).then(function (m) {
+      m.initialize(mermaidConfig());
+      return m;
+    });
+    return mermaidLoad;
+  }
+
+  // Lifts every ```mermaid fence out of the sanitized markdown and leaves a
+  // host in its place, with the original <pre> tucked inside it.
+  function extractMermaid(box) {
+    var out = [];
+    if (!box || !box.querySelectorAll) { return out; }
+    var codes = box.querySelectorAll("pre > code.language-mermaid, pre > code.lang-mermaid");
+    for (var i = 0; i < codes.length; i++) {
+      var code = codes[i];
+      var pre = code.parentNode;
+      if (!pre || !pre.parentNode) { continue; }
+      var src = code.textContent || "";
+      if (!src.trim()) { continue; }
+      var host = el("div", "mmd");
+      var slot = el("div", "mmd-svg");
+      pre.parentNode.insertBefore(host, pre);
+      host.appendChild(slot);
+      host.appendChild(pre);          // the source travels with its diagram
+      code.className = code.className + " mmd-src";   // skipped by the hljs pass
+      out.push({ host: host, slot: slot, pre: pre, src: src });
+    }
+    return out;
+  }
+
+  function mermaidFallback(item) {
+    while (item.slot.firstChild) { item.slot.removeChild(item.slot.firstChild); }
+    item.pre.classList.remove("hidden");
+  }
+
+  function drawMermaid(items) {
+    if (!items || !items.length) { return; }
+    items.forEach(function (it) { it.pre.classList.add("hidden"); });
+    loadMermaid().then(function (m) {
+      items.forEach(function (it) { drawMermaidOne(m, it); });
+    }, function () {
+      items.forEach(mermaidFallback);
+    });
+  }
+
+  function drawMermaidOne(m, it) {
+    var id = "mmd-" + (++mermaidSeq);
+
+    // mermaid draws through a temporary <div id="d<id>"> on <body>. It tidies
+    // that away when it succeeds, but on a parse error it leaves the div there
+    // holding its own "syntax error" graphic, which would then float above the
+    // document. Nothing of a failed render may survive except the source.
+    function sweep() {
+      var ids = ["d" + id, id];
+      for (var i = 0; i < ids.length; i++) {
+        var n = document.getElementById(ids[i]);
+        if (n && n.parentNode && !it.slot.contains(n)) { n.parentNode.removeChild(n); }
+      }
+    }
+
+    var p;
+    try {
+      p = m.render(id, it.src);
+    } catch (err) { sweep(); mermaidFallback(it); return; }
+    if (!p || typeof p.then !== "function") { sweep(); mermaidFallback(it); return; }
+    p.then(function (out) {
+      sweep();
+      var svg = out && out.svg;
+      if (!svg || !window.DOMPurify) { mermaidFallback(it); return; }
+      var clean;
+      try {
+        clean = DOMPurify.sanitize(svg, { USE_PROFILES: { svg: true, svgFilters: true, html: true } });
+      } catch (err) { mermaidFallback(it); return; }
+      if (clean.indexOf("<svg") < 0) { mermaidFallback(it); return; }
+      it.slot.innerHTML = clean;
+      it.pre.classList.add("hidden");
+      mermaidLive.push(it);
+    }, function () {
+      // A syntax error in the document's own diagram: show the source.
+      sweep();
+      mermaidFallback(it);
+    });
+  }
+
+  function inDom(node) {
+    if (!node) { return false; }
+    if (typeof node.isConnected === "boolean") { return node.isConnected; }
+    return document.contains(node);
+  }
+
+  // mermaid bakes its palette into the SVG, so a light/dark flip means drawing
+  // every diagram still on the page again.
+  function restyleMermaid() {
+    if (!mermaidLoad || !window.mermaid || !mermaidLive.length) { return; }
+    var live = mermaidLive.filter(function (it) { return inDom(it.host); });
+    mermaidLive = [];
+    if (!live.length) { return; }
+    try { window.mermaid.initialize(mermaidConfig()); } catch (err) { return; }
+    live.forEach(function (it) { drawMermaidOne(window.mermaid, it); });
+  }
+
+  (function () {
+    try {
+      var mq = window.matchMedia("(prefers-color-scheme: dark)");
+      if (mq.addEventListener) { mq.addEventListener("change", restyleMermaid); }
+      else if (mq.addListener) { mq.addListener(restyleMermaid); }
+    } catch (err) { /* no matchMedia: diagrams keep the theme they were drawn in */ }
+  })();
+
+  // ---- chrome ----------------------------------------------------------
+
+  function showPane(id) {
+    var panes = document.querySelectorAll(".pane");
+    for (var i = 0; i < panes.length; i++) {
+      panes[i].classList.toggle("on", panes[i].id === id);
+    }
+  }
+
+  function setStatus(title, text, isError) {
+    $("status").classList.toggle("error", !!isError);
+    $("status").querySelector("h2").textContent = title;
+    $("status-text").textContent = text;   // untrusted: textContent only
+    showPane("pane-status");
+  }
+
+  function formatBytes(n) {
+    if (n === null || n === undefined || isNaN(n)) { return ""; }
+    n = Number(n);
+    if (n < 1024) { return n + " B"; }
+    var units = ["KB", "MB", "GB", "TB"];
+    var value = n / 1024;
+    var i = 0;
+    while (value >= 1024 && i < units.length - 1) { value /= 1024; i++; }
+    return (value < 10 ? value.toFixed(1) : Math.round(value)) + " " + units[i];
+  }
+
+  function setMeta(size, lastModified, contentType) {
+    var meta = $("meta");
+    meta.textContent = "";
+    var parts = [];
+    if (size !== null && size !== "") { parts.push(formatBytes(size)); }
+    if (lastModified) {
+      var when = new Date(lastModified);
+      parts.push(isNaN(when.getTime()) ? lastModified : when.toLocaleString());
+    }
+    if (contentType) { parts.push(String(contentType).split(";")[0]); }
+    parts.forEach(function (part, index) {
+      if (index) {
+        var sep = document.createElement("span");
+        sep.className = "sep";
+        sep.textContent = "·";
+        meta.appendChild(sep);
+      }
+      meta.appendChild(document.createTextNode(part));
+    });
+  }
+
+  // ---- renderers -------------------------------------------------------
+
+  function renderCode(text, language) {
+    var code = $("code");
+    code.textContent = text;                       // safe default
+    code.className = "";
+    if (window.hljs) {
+      try {
+        var result = language && hljs.getLanguage(language)
+          ? hljs.highlight(text, { language: language, ignoreIllegals: true })
+          : hljs.highlightAuto(text);
+        // hljs escapes its own output; this is the one place we trust it.
+        code.innerHTML = result.value;
+        code.className = "hljs";
+      } catch (err) {
+        code.textContent = text;
+      }
+    }
+    var lines = text.split("\n");
+    if (lines.length && lines[lines.length - 1] === "") { lines.pop(); }
+    var numbers = [];
+    for (var i = 1; i <= Math.max(lines.length, 1); i++) { numbers.push(i); }
+    $("gutter").textContent = numbers.join("\n");
+    showPane("pane-code");
+  }
+
+  function renderMarkdown(text) {
+    var doc = $("doc");
+    if (!window.marked || !window.DOMPurify) {
+      // Libraries blocked or offline: never dump raw HTML into the page.
+      renderCode(text, "markdown");
+      return;
+    }
+    var html;
+    try {
+      html = (typeof marked.parse === "function" ? marked.parse(text) : marked(text));
+    } catch (err) {
+      renderCode(text, "markdown");
+      return;
+    }
+    doc.innerHTML = DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
+    // Mermaid fences are lifted out before highlighting, so the source they
+    // leave behind is the untouched fallback if a diagram cannot be drawn.
+    var diagrams = extractMermaid(doc);
+    if (window.hljs) {
+      var blocks = doc.querySelectorAll("pre code:not(.mmd-src)");
+      for (var i = 0; i < blocks.length; i++) {
+        try { hljs.highlightElement(blocks[i]); } catch (err) { /* leave as text */ }
+      }
+    }
+    // Links out of a rendered document open in a new tab and carry nothing.
+    var links = doc.querySelectorAll("a[href]");
+    for (var j = 0; j < links.length; j++) {
+      links[j].setAttribute("target", "_blank");
+      links[j].setAttribute("rel", "noopener noreferrer nofollow");
+    }
+    showPane("pane-doc");
+    drawMermaid(diagrams);
+  }
+
+  function renderFrame() {
+    // src (not srcdoc) so the document's own relative URLs resolve against
+    // /api/file and fail closed, and so sandbox keeps it in an opaque origin.
+    $("frame").setAttribute("src", rawUrl);
+    showPane("pane-frame");
+  }
+
+  // ---- toggle ----------------------------------------------------------
+
+  var sourceText = null;
+  var mode = "rendered";
+  var kind = "code";
+
+  function applyMode() {
+    $("btn-rendered").classList.toggle("on", mode === "rendered");
+    $("btn-source").classList.toggle("on", mode === "source");
+    if (mode === "source") {
+      if (sourceText === null) {
+        setStatus("Loading", "Fetching source…", false);
+        fetchText().then(function (text) {
+          sourceText = text;
+          renderCode(text, kind === "markdown" ? "markdown" : "xml");
+        }, function (err) {
+          setStatus("Could not read the file", String(err && err.message || err), true);
+        });
+        return;
+      }
+      renderCode(sourceText, kind === "markdown" ? "markdown" : "xml");
+      return;
+    }
+    if (kind === "html") { renderFrame(); return; }
+    renderMarkdown(sourceText || "");
+  }
+
+  function fetchText() {
+    return fetch(rawUrl, { cache: "no-store" }).then(function (response) {
+      if (!response.ok) {
+        return response.text().then(function (body) {
+          var message = "HTTP " + response.status;
+          try {
+            var parsed = JSON.parse(body);
+            if (parsed && parsed.error) { message = parsed.error; }
+          } catch (err) { /* not JSON: keep the status */ }
+          throw new Error(message);
+        });
+      }
+      return response.text();
+    });
+  }
+
+  function looksBinary(text) {
+    return text.slice(0, 4096).indexOf("\x00") !== -1;
+  }
+
+  // ---- boot ------------------------------------------------------------
+
+  function boot() {
+    $("path").textContent = filePath || "(no path given)";
+    document.title = (filePath.split(/[\\/]/).pop() || "Artifact") + " — Claude Audit";
+    $("raw").setAttribute("href", rawUrl);
+
+    if (!filePath) {
+      setStatus("No file selected", "Open this page as /view?path=<absolute file path>.", true);
+      $("raw").removeAttribute("href");
+      return;
+    }
+
+    var ext = extensionOf(filePath);
+    $("btn-rendered").addEventListener("click", function () { mode = "rendered"; applyMode(); });
+    $("btn-source").addEventListener("click", function () { mode = "source"; applyMode(); });
+
+    // HEAD first: size, mtime and content type without pulling a 200MB log
+    // into memory to find out it is a 200MB log.
+    fetch(rawUrl, { method: "HEAD", cache: "no-store" }).then(function (response) {
+      if (!response.ok) {
+        var message = response.status === 403
+          ? "This path is outside every workspace the audit database knows about, so the service refuses to read it."
+          : (response.status === 404 ? "The file no longer exists on disk." : "HTTP " + response.status);
+        setStatus("Not available", message, true);
+        return;
+      }
+      var size = response.headers.get("content-length");
+      var modified = response.headers.get("last-modified");
+      var ctype = response.headers.get("content-type") || "";
+      setMeta(size, modified, ctype);
+
+      if (inList(ext, IMAGE_EXT) || ctype.indexOf("image/") === 0) {
+        $("image").setAttribute("src", rawUrl);
+        $("image").setAttribute("alt", filePath);
+        showPane("pane-image");
+        return;
+      }
+
+      if (inList(ext, HTML_EXT)) {
+        kind = "html";
+        $("toggle").hidden = false;
+        renderFrame();
+        return;
+      }
+
+      if (inList(ext, MARKDOWN_EXT)) {
+        kind = "markdown";
+        $("toggle").hidden = false;
+        setStatus("Loading", "Fetching document…", false);
+        fetchText().then(function (text) {
+          sourceText = text;
+          renderMarkdown(text);
+        }, function (err) {
+          setStatus("Could not read the file", String(err && err.message || err), true);
+        });
+        return;
+      }
+
+      kind = "code";
+      setStatus("Loading", "Fetching file…", false);
+      fetchText().then(function (text) {
+        sourceText = text;
+        if (looksBinary(text)) {
+          setStatus(
+            "Binary file",
+            "This file is not text (" + (ctype || "unknown type") + ", " +
+            formatBytes(size) + "). Use the Raw link to download it.",
+            false
+          );
+          return;
+        }
+        renderCode(text, LANG[ext] || null);
+      }, function (err) {
+        setStatus("Could not read the file", String(err && err.message || err), true);
+      });
+    }, function (err) {
+      setStatus("Service unreachable", String(err && err.message || err), true);
+    });
+  }
+
+  boot();
+})();
+</script>
+</body>
+</html>
