@@ -10,7 +10,7 @@
       "name": "claude-audit",
       "source": "./plugins/claude-audit",
       "description": "Audit every Claude Code prompt turn into a per-workspace SQLite DB with Haiku tagging and a standalone HTML viewer",
-      "version": "3.2.0"
+      "version": "3.2.1"
     }
   ]
 }

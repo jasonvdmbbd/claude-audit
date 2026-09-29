@@ -58,7 +58,11 @@ from urllib.parse import quote, urlsplit
 # Constants
 # --------------------------------------------------------------------------
 
-HAIKU_MODEL = "claude-haiku-4-5-20251001"
+# The classifier model rides whatever routing the local `claude` CLI has —
+# first-party by default, but a proxy/Vertex environment can point it at its
+# own model name (e.g. "vertex-ai/claude-haiku-4-5@20251001") via this env
+# var, set in the shell or in settings.json's "env" block so hooks see it.
+HAIKU_MODEL = os.environ.get("CLAUDE_AUDIT_CLASSIFY_MODEL", "claude-haiku-4-5-20251001")
 CLASSIFY_TIMEOUT_S = 120
 MAX_RESULT_CHARS = 10_000       # per tool result stored
 MAX_INPUT_CHARS = 10_000        # per tool input stored

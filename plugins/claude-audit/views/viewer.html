@@ -1431,6 +1431,7 @@ table.dtable .swatch {
     var at = s.indexOf("@");
     if (at > 0) s = s.slice(0, at);                       // vertex "…@20250219"
     s = s.replace(/^publishers\/anthropic\/models\//, "");
+    if (s.indexOf("/") >= 0) s = s.split("/").pop();       // litellm/proxy "vertex-ai/claude-…"
     s = s.replace(/^(us|eu|apac|global)[.\-]/, "");        // bedrock cross-region
     s = s.replace(/^anthropic[.\/]/, "");
     s = s.replace(/-v\d+:\d+$/, "");                       // bedrock "-v1:0"
