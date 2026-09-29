@@ -193,6 +193,41 @@ header.top {
 .live.stale { color: var(--danger); border-color: var(--danger); }
 .live.stale i { background: var(--danger); box-shadow: none; }
 
+/* classify control — service mode only, and it sits with the live badge
+   because it is part of the same story: this page is talking to a service on
+   this machine, and that service is the only thing able to run the
+   summariser. On file:// (and on the picker fallback) it stays hidden. */
+.clsf { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; max-width: 100%; }
+.clsf .redo {
+  display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+  font-size: 11.5px; color: var(--text-dim); cursor: pointer;
+}
+.clsf .redo input { margin: 0; }
+.clsf .redo.off { opacity: .5; cursor: default; }
+/* The pill takes the button's place while a run is in flight, so the control
+   never shows both an invitation to start and a run already going. */
+.clsf .pill {
+  display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+  font-size: 12px; color: var(--accent); font-variant-numeric: tabular-nums;
+  background: var(--accent-soft); border: 1px solid var(--accent);
+  border-radius: 999px; padding: 3px 10px;
+}
+.clsf .pill i {
+  flex: none; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent); animation: clsf-pulse 1.1s ease-in-out infinite;
+}
+@keyframes clsf-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) { .clsf .pill i { animation: none; } }
+.clsf .note { font-size: 11.5px; color: var(--text-dim); overflow-wrap: anywhere; }
+.clsf .note.bad { color: var(--danger); }
+.clsf .note code {
+  font-family: var(--mono); font-size: 11.5px; background: var(--bg-code);
+  border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px;
+  color: var(--text); white-space: nowrap;
+}
+/* A long error would otherwise stretch the header row; let it take its own. */
+.clsf .note.wide { flex: 1 1 100%; }
+
 button, .btn {
   font: inherit; font-size: 13px;
   color: var(--text); background: var(--bg-elev);
@@ -986,6 +1021,16 @@ table.dtable .swatch {
       <span class="live hidden" id="live" title="Connected to the local audit service">
         <i></i><span>live</span><span class="lp" id="live-port"></span>
       </span>
+      <!-- Service mode only: unhidden by enterServiceMode(), never on file://. -->
+      <span class="clsf hidden" id="clsf">
+        <button id="btn-classify" type="button">Summarise</button>
+        <label class="redo hidden" id="clsf-redo">
+          <input type="checkbox" id="clsf-redo-cb">
+          <span id="clsf-redo-lbl">also redo heuristic-tagged rows</span>
+        </label>
+        <span class="pill hidden" id="clsf-pill" role="status" aria-live="polite"><i></i><span id="clsf-pill-text">Summarising…</span></span>
+        <span class="note hidden" id="clsf-note" role="status" aria-live="polite"></span>
+      </span>
       <button id="btn-merge" class="hidden" title="Fold a backed-up audit database into the live one">Merge database…</button>
       <button id="btn-open" class="primary">Open database…</button>
       <button id="btn-reload" class="hidden">Reload file</button>
@@ -1102,7 +1147,8 @@ table.dtable .swatch {
   // Everything below stays exactly as it was when this is false (file:// too).
   var serviceMode = false;
   var API = { health: "/api/health", db: "/api/db", events: "/api/events",
-              merge: "/api/merge", view: "/view" };
+              merge: "/api/merge", view: "/view",
+              classify: "/api/classify", classifyStatus: "/api/classify/status" };
 
   var state = {
     tag: "all",      // all | plan | build | fix | validate | docs | ops | chat | untagged
@@ -2312,6 +2358,9 @@ table.dtable .swatch {
     $("app").classList.remove("hidden");
     // In service mode the DB is pushed to us, so there is nothing to reload by hand.
     if (!serviceMode) $("btn-reload").classList.remove("hidden");
+    // Recount what is left to summarise against the database that just landed.
+    // While a run is going this only repaints the pill — the poll owns it.
+    refreshClassifyControl();
 
     try {
       renderWorkspaceSelect();
@@ -2755,6 +2804,397 @@ table.dtable .swatch {
     openModal("Merge a database into the live audit log", host);
   }
 
+  // ---- classify: ask the service to summarise the rows nothing has tagged --
+  //
+  // Service mode only, for the same reason merge is: running the classifier
+  // means running the `claude` CLI on this machine, which only the audit
+  // service can do. The page's job is to say how much work is outstanding,
+  // start it, and report where it got to — the rows themselves arrive through
+  // the ordinary db-change → reload path, so the list underneath fills in
+  // while the run is going.
+  //
+  // The run's state lives here, in module scope, and the poll owns the pill.
+  // A db-change reload re-renders every list and chart on the page but never
+  // touches these nodes, so a run survives any number of reloads mid-flight.
+  var clsfRun = {
+    active: false,     // a run we are polling
+    timer: null,       // setTimeout handle for the next poll
+    inFlight: false,   // a status request is out; do not stack another
+    misses: 0,         // consecutive status failures tolerated before giving up
+    done: 0,
+    total: null,
+    starting: false    // POST sent, no answer yet
+  };
+  var CLSF_POLL_MS = 2000;
+  var CLSF_MAX_MISSES = 5;   // ~10s of silence before the pill gives up
+
+  // null = not probed yet (control stays hidden); false = this service has no
+  // classify endpoint, so the control never appears at all.
+  var clsfSupported = null;
+
+  // How much work is outstanding, straight out of the loaded database. Empty
+  // strings count as untagged here because every other filter on this page
+  // treats them that way.
+  //
+  // Deliberately DB-wide: the workspace / hide-system filters change what is
+  // on screen, but the run classifies the whole file, so a count that moved
+  // with the filters would promise something the button does not do.
+  function classifyWork() {
+    var out = { pending: 0, heuristic: 0, ok: false };
+    if (!db || !turnCols.tag) return out;
+    function count(sql) {
+      try {
+        var r = one(sql);
+        return r ? Number(r.n) || 0 : 0;
+      } catch (e) { return 0; }
+    }
+    var notSynth = turnCols.is_synthetic
+      ? " AND (is_synthetic IS NULL OR is_synthetic = 0)" : "";
+    // A pending turn is a prompt the UserPromptSubmit hook opened whose
+    // response has not been written yet — there is nothing to classify, and
+    // the classify-pending run on the other end never touches it (see
+    // PENDING_TURNS_SQL / CLASSIFY_PENDING_TURNS_SQL in audit_log.py /
+    // service.py, kept textually identical to this). Left uncounted here, a
+    // turn in flight in the very session driving this page would otherwise
+    // inflate "pending" by one forever.
+    var notPending = turnCols.status ? " AND status != 'pending'" : "";
+    out.pending = count(
+      "SELECT COUNT(*) AS n FROM turns WHERE (tag IS NULL OR tag = '')" + notSynth + notPending);
+    if (turnCols.tag_source) {
+      out.heuristic = count(
+        "SELECT COUNT(*) AS n FROM turns WHERE tag_source = 'heuristic'" + notSynth + notPending);
+    }
+    if (hasAgents && agentCols.tag) {
+      out.pending += count(
+        "SELECT COUNT(*) AS n FROM agents WHERE (tag IS NULL OR tag = '')");
+      if (agentCols.tag_source) {
+        out.heuristic += count(
+          "SELECT COUNT(*) AS n FROM agents WHERE tag_source = 'heuristic'");
+      }
+    }
+    out.ok = true;
+    return out;
+  }
+
+  function clsfNote(msg, bad, cmd) {
+    var note = $("clsf-note");
+    if (!note) return;
+    clear(note);
+    if (!msg) { note.classList.add("hidden"); note.classList.remove("bad", "wide"); return; }
+    note.appendChild(document.createTextNode(String(msg)));
+    if (cmd) {
+      note.appendChild(document.createTextNode(" "));
+      note.appendChild(el("code", null, String(cmd)));
+    }
+    note.classList.remove("hidden");
+    note.classList.toggle("bad", !!bad);
+    // Anything longer than a few words gets its own line rather than pushing
+    // the buttons around.
+    note.classList.toggle("wide", String(msg).length > 48);
+  }
+
+  function clsfPill(text) {
+    var pill = $("clsf-pill");
+    if (!pill) return;
+    if (text === null) { pill.classList.add("hidden"); return; }
+    $("clsf-pill-text").textContent = text;
+    pill.classList.remove("hidden");
+  }
+
+  function clsfPillText() {
+    if (clsfRun.starting && !clsfRun.active) return "Starting…";
+    if (clsfRun.total) return "Summarising " + num(clsfRun.done) + "/" + num(clsfRun.total) + "…";
+    if (clsfRun.done) return "Summarising " + num(clsfRun.done) + "…";
+    return "Summarising…";
+  }
+
+  // The single place that decides what the control looks like. Safe to call
+  // from any render pass: while a run is going it only refreshes the pill, so
+  // a reload triggered by db-change cannot knock the run's state out.
+  function refreshClassifyControl() {
+    var host = $("clsf");
+    if (!host) return;
+    var btn = $("btn-classify");
+    var redo = $("clsf-redo");
+    var cb = $("clsf-redo-cb");
+
+    if (!serviceMode || clsfSupported === null || clsfSupported === false) {
+      host.classList.add("hidden");
+      return;
+    }
+
+    if (clsfRun.active || clsfRun.starting) {
+      host.classList.remove("hidden");
+      btn.classList.add("hidden");
+      redo.classList.add("hidden");
+      clsfPill(clsfPillText());
+      return;
+    }
+
+    clsfPill(null);
+    var work = classifyWork();
+    if (!work.ok || (!work.pending && !work.heuristic)) {
+      host.classList.add("hidden");
+      return;
+    }
+    host.classList.remove("hidden");
+    btn.classList.remove("hidden");
+    btn.disabled = false;
+
+    if (work.pending) {
+      btn.textContent = "Summarise " + num(work.pending) + " pending";
+      btn.title = "Ask the audit service to write a tag and title for the " +
+        num(work.pending) + " turn(s) and sub-agent(s) nothing has classified yet, " +
+        "across the whole database.";
+    } else {
+      // Nothing is untagged, but heuristic guesses are still worth redoing —
+      // that is the only work left, so the button says so and the checkbox
+      // stops being a choice.
+      btn.textContent = "Re-summarise " + num(work.heuristic) + " heuristic";
+      btn.title = "Nothing is untagged. These rows were tagged by the keyword " +
+        "fallback rather than the model, and can be redone properly.";
+    }
+
+    if (work.heuristic) {
+      redo.classList.remove("hidden");
+      $("clsf-redo-lbl").textContent =
+        "also redo " + num(work.heuristic) + " heuristic-tagged row" +
+        (work.heuristic === 1 ? "" : "s");
+      var forced = !work.pending;
+      cb.disabled = forced;
+      if (forced) cb.checked = true;
+      redo.classList.toggle("off", forced);
+      redo.title = forced
+        ? "There is nothing else left to do, so this run redoes the heuristic rows."
+        : "Rows the keyword fallback tagged when the model was unavailable. " +
+          "Including them makes the run longer.";
+    } else {
+      redo.classList.add("hidden");
+      cb.checked = false;
+      cb.disabled = false;
+    }
+  }
+
+  // Readers for the status body. The shape is the service's, so each number is
+  // looked up under the names a reasonable service would use and a missing one
+  // is simply absent rather than zero — "Summarising 12…" is honest when the
+  // total is unknown; "12/0" would not be.
+  function clsfNum(obj, keys) {
+    for (var i = 0; i < keys.length; i++) {
+      var v = obj[keys[i]];
+      if (typeof v === "number" && isFinite(v)) return v;
+      if (typeof v === "string" && v !== "" && isFinite(Number(v))) return Number(v);
+    }
+    return null;
+  }
+
+  var CLSF_RUNNING_WORDS = { running: 1, in_progress: 1, inprogress: 1, working: 1, busy: 1, started: 1, pending: 1 };
+
+  function readClassifyStatus(data) {
+    var d = (data && typeof data === "object") ? data : {};
+    var b = (d.status && typeof d.status === "object") ? d.status : d;
+    var st = {
+      done: clsfNum(b, ["done", "completed", "processed", "classified", "finished"]),
+      total: clsfNum(b, ["total", "count", "queued", "to_do", "todo"]),
+      failed: clsfNum(b, ["failed", "errors", "error_count", "failures"]),
+      ok: clsfNum(b, ["ok", "succeeded", "summarised", "summarized", "classified_ok", "tagged"]),
+      error: (typeof b.error === "string" && b.error) ? b.error : null,
+      running: null
+    };
+    var word = (typeof b.state === "string" && b.state) ||
+               (typeof d.status === "string" && d.status) || "";
+    if (typeof b.running === "boolean") st.running = b.running;
+    else if (typeof b.active === "boolean") st.running = b.active;
+    else if (word) st.running = !!CLSF_RUNNING_WORDS[String(word).toLowerCase()];
+    else if (st.done !== null && st.total !== null) st.running = st.done < st.total;
+    else st.running = false;   // no signal at all: treat as finished rather than spin forever
+    return st;
+  }
+
+  // The plainly-worded version of the one failure a person can actually fix.
+  function clsfAuthError() {
+    clsfNote("The claude CLI on this machine isn't signed in — run:", true, "claude login");
+    var note = $("clsf-note");
+    if (note) note.appendChild(document.createTextNode(" — then try again."));
+  }
+
+  function clsfStop() {
+    clsfRun.active = false;
+    clsfRun.starting = false;
+    clsfRun.inFlight = false;
+    clearTimeout(clsfRun.timer);
+    clsfRun.timer = null;
+    clsfRun.misses = 0;
+    clsfRun.done = 0;
+    clsfRun.total = null;
+    refreshClassifyControl();
+  }
+
+  function clsfSchedulePoll() {
+    clearTimeout(clsfRun.timer);
+    clsfRun.timer = setTimeout(clsfPoll, CLSF_POLL_MS);
+  }
+
+  // Adopt a run: used both after a successful POST and after a 409, and when
+  // the page loads while the service is already working.
+  function clsfAdopt(st) {
+    clsfRun.active = true;
+    clsfRun.starting = false;
+    if (st) {
+      if (st.done !== null) clsfRun.done = st.done;
+      if (st.total !== null) clsfRun.total = st.total;
+    }
+    refreshClassifyControl();
+    clsfSchedulePoll();
+  }
+
+  function clsfFinish(st) {
+    var done = st && st.done !== null ? st.done : clsfRun.done;
+    var failed = st && st.failed !== null ? st.failed : 0;
+    var ok = (st && st.ok !== null) ? st.ok : Math.max(0, done - failed);
+    clsfStop();
+    if (st && st.error === "cli_auth") { clsfAuthError(); return; }
+    if (st && st.error) {
+      clsfNote("The summariser stopped: " + firstLine(st.error, 160), true);
+      return;
+    }
+    if (!ok && !failed) {
+      clsfNote("Nothing left to summarise.");
+    } else {
+      clsfNote(num(ok) + " summarised" + (failed ? ", " + num(failed) + " failed" : "") + ".",
+               !!failed && !ok);
+    }
+    // The service fires db-change as rows land, so the page is normally already
+    // current; this is the belt to that braces and refreshes the count.
+    scheduleServiceReload();
+  }
+
+  function clsfPoll() {
+    if (!clsfRun.active || clsfRun.inFlight) return;
+    clsfRun.inFlight = true;
+    fetchTimeout(API.classifyStatus, 10000, { cache: "no-store" }).then(function (res) {
+      return res.text().then(function (txt) { return { res: res, txt: txt }; },
+                            function () { return { res: res, txt: "" }; });
+    }).then(function (r) {
+      clsfRun.inFlight = false;
+      if (!clsfRun.active) return;   // stopped while the request was out
+      if (!r.res.ok) {
+        if (r.res.status === 404 || r.res.status === 501) {
+          clsfStop();
+          clsfNote("This audit service cannot report progress — it is older than this page. " +
+                   "The run may still be going; reload to see where it got to.", true);
+          return;
+        }
+        throw new Error("HTTP " + r.res.status);
+      }
+      var data = null;
+      try { data = r.txt ? JSON.parse(r.txt) : null; } catch (e) { data = null; }
+      if (!data) throw new Error("not JSON");
+      clsfRun.misses = 0;
+      var st = readClassifyStatus(data);
+      if (st.done !== null) clsfRun.done = st.done;
+      if (st.total !== null) clsfRun.total = st.total;
+      if (st.error === "cli_auth") { clsfStop(); clsfAuthError(); return; }
+      if (!st.running) { clsfFinish(st); return; }
+      clsfPill(clsfPillText());
+      clsfSchedulePoll();
+    }).catch(function (e) {
+      clsfRun.inFlight = false;
+      if (!clsfRun.active) return;
+      // A blip while the service is busy classifying is expected; only a run
+      // of them means the page has genuinely lost the thread.
+      clsfRun.misses += 1;
+      if (clsfRun.misses >= CLSF_MAX_MISSES) {
+        clsfStop();
+        clsfNote("Lost contact with the audit service while summarising (" +
+                 (e && e.message ? e.message : String(e)) +
+                 ") — the run may still be going; reload to see where it got to.", true);
+        return;
+      }
+      clsfSchedulePoll();
+    });
+  }
+
+  function startClassify() {
+    if (clsfRun.active || clsfRun.starting) return;
+    var cb = $("clsf-redo-cb");
+    var redoHeuristic = !!(cb && cb.checked);
+    clsfNote(null);
+    clsfRun.done = 0;
+    clsfRun.total = null;
+    clsfRun.misses = 0;
+    clsfRun.starting = true;
+    refreshClassifyControl();
+
+    fetchTimeout(API.classify, 30000, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ redo_heuristic: redoHeuristic }),
+      cache: "no-store"
+    }).then(function (res) {
+      return res.text().then(function (txt) { return { res: res, txt: txt }; },
+                            function () { return { res: res, txt: "" }; });
+    }, function (err) {
+      if (err && err.name === "AbortError") throw new Error("The audit service did not answer within 30 seconds.");
+      throw new Error("Could not reach the audit service: " + (err && err.message ? err.message : String(err)));
+    }).then(function (r) {
+      var data = null;
+      try { data = r.txt ? JSON.parse(r.txt) : null; } catch (e) { data = null; }
+
+      // cli_auth is the one answer that is the same story at any status code.
+      if (data && data.error === "cli_auth") {
+        clsfStop();
+        clsfAuthError();
+        return;
+      }
+      if (r.res.status === 409) {
+        // Something already has the classifier: not an error, just a run we
+        // did not start. Watch it like our own.
+        clsfNote("A summarise run is already going — following it.");
+        clsfAdopt(data ? readClassifyStatus(data) : null);
+        return;
+      }
+      if (!r.res.ok) {
+        var why = (data && (data.error || data.message)) ||
+          ((r.res.status === 404 || r.res.status === 501)
+            ? "this audit service does not accept POST /api/classify — it is older than this page"
+            : stripTags(r.txt));
+        throw new Error("Could not start summarising — HTTP " + r.res.status + (why ? ": " + why : "."));
+      }
+      if (data && data.ok === false) {
+        throw new Error(data.error ? String(data.error) : "The service reported that the run did not start.");
+      }
+      clsfAdopt(data ? readClassifyStatus(data) : null);
+    }).catch(function (e) {
+      clsfStop();
+      clsfNote(e && e.message ? e.message : String(e), true);
+    });
+  }
+
+  // One probe when service mode starts: it tells us whether this service has
+  // the endpoint at all (an older one does not, and then the control never
+  // appears), and it picks up a run that was already going before this page
+  // was opened or reloaded.
+  function probeClassify() {
+    fetchTimeout(API.classifyStatus, 3000, { cache: "no-store" }).then(function (res) {
+      if (res.status === 404 || res.status === 501) { clsfSupported = false; return null; }
+      clsfSupported = true;
+      if (!res.ok) return null;
+      return res.json().catch(function () { return null; });
+    }).then(function (data) {
+      if (data) {
+        var st = readClassifyStatus(data);
+        if (st.running) { clsfAdopt(st); return; }
+      }
+      refreshClassifyControl();
+    }).catch(function () {
+      // A network blip says nothing about the endpoint; assume it is there
+      // and let the POST report the truth if it is not.
+      clsfSupported = true;
+      refreshClassifyControl();
+    });
+  }
+
   function enterServiceMode(health) {
     serviceMode = true;
     var port = (health && health.port) || window.location.port || "";
@@ -2765,6 +3205,7 @@ table.dtable .swatch {
     $("empty").classList.add("hidden");
 
     loadFromService(true);
+    probeClassify();
 
     if (typeof window.EventSource === "function") {
       var es;
@@ -7427,6 +7868,8 @@ table.dtable .swatch {
   $("btn-reload").addEventListener("click", reload);
   // Service mode only: enterServiceMode() is what un-hides this button.
   $("btn-merge").addEventListener("click", openMergeModal);
+  // Service mode only, and only once probeClassify() has found the endpoint.
+  $("btn-classify").addEventListener("click", startClassify);
 
   $("file").addEventListener("change", function (e) {
     var f = e.target.files && e.target.files[0];

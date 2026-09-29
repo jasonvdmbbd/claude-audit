@@ -25,6 +25,8 @@ Endpoints (all `X-Content-Type-Options: nosniff`)
     GET  /api/files       files touched by Write/Edit/NotebookEdit/MultiEdit
     GET  /api/file?path=  one file's bytes, ONLY from inside a known workspace
     POST /api/merge       fold an uploaded audit database into the central one
+    POST /api/classify    start a bulk tag+title run over the unclassified rows
+    GET  /api/classify/status  how that run is getting on
 
 Design rules (inherited from audit_log.py)
     * Bind 127.0.0.1 and nothing else. The hard-coded loopback address below
@@ -35,13 +37,17 @@ Design rules (inherited from audit_log.py)
     * Stdlib only. No dependency may stand between a hook and a running
       service, because the Stop hook starts this process (see the watchdog in
       audit_log.py) and a hook must never fail the turn.
-    * Reads are the rule; /api/merge is the single, deliberate exception.
-      There is still no directory listing, the only path that can reach the
-      filesystem is /api/file -- which serves a realpath'd file only when it
-      sits inside a workspace the database itself has recorded -- and the only
-      thing a write can do is hand bytes to the merge engine in audit_log.py.
-      An upload never lands in a workspace: it is streamed to the service's
-      own directory, validated, merged, and deleted.
+    * Reads are the rule; the two POSTs are deliberate exceptions and neither
+      invents any behaviour of its own. There is still no directory listing,
+      the only path that can reach the filesystem is /api/file -- which serves
+      a realpath'd file only when it sits inside a workspace the database
+      itself has recorded. /api/merge hands bytes to the merge engine in
+      audit_log.py and an upload never lands in a workspace: it is streamed to
+      the service's own directory, validated, merged, and deleted.
+      /api/classify starts `audit_log.py classify-pending` as a detached
+      child, writes only the two status sidecars beside the database, and can
+      touch no row the CLI does not already reach. Both refuse a cross-site
+      POST, because loopback is not an authorisation boundary in a browser.
 """
 
 from __future__ import annotations
@@ -136,6 +142,33 @@ SQLITE_MAGIC = b"SQLite format 3\x00"
 # The tables a file must have before it is allowed anywhere near the merge.
 REQUIRED_SOURCE_TABLES = ("sessions", "turns")
 
+# ---- /api/classify -------------------------------------------------------
+# The bulk classifier IS audit_log.py's `classify-pending`; this endpoint only
+# starts it and reports on it. A detached child rather than a request thread
+# because the run can take many minutes -- it spends nearly all of them
+# waiting on one headless `claude` per row -- and a browser should not be
+# holding a socket open for that.
+CLASSIFY_PROGRESS_NAME = "classify-progress.json"   # rewritten per row
+CLASSIFY_RESULT_NAME = "classify-result.json"       # the child's final stdout
+CLASSIFY_BODY_LIMIT = 64 * 1024                     # {"redo_heuristic": bool}
+
+# The scope counts for the 202. Kept TEXTUALLY IDENTICAL to audit_log.py's
+# PENDING_TURNS_SQL / PENDING_AGENTS_SQL predicates, and duplicated for the
+# same reason default_db_path() is duplicated at the top of this file: a
+# process launched by launchd or by a hook must not have to import a
+# 4700-line sibling to answer "how many rows would that button touch". The
+# numbers are advisory -- the child re-runs the real query itself.
+CLASSIFY_PENDING_TURNS_SQL = (
+    "SELECT COUNT(*) FROM turns WHERE COALESCE(is_synthetic, 0) = 0"
+    " AND status != 'pending' AND tag IS NULL"
+)
+CLASSIFY_PENDING_AGENTS_SQL = "SELECT COUNT(*) FROM agents WHERE tag IS NULL"
+CLASSIFY_HEURISTIC_SQL = (
+    "SELECT (SELECT COUNT(*) FROM turns WHERE COALESCE(is_synthetic, 0) = 0"
+    " AND status != 'pending' AND tag_source = 'heuristic')"
+    " + (SELECT COUNT(*) FROM agents WHERE tag_source = 'heuristic')"
+)
+
 # Every route that answers GET/HEAD and nothing else -- so a POST to one of
 # them is told 405 rather than 404, which is the difference between "you used
 # the wrong verb" and "you misread the docs".
@@ -152,6 +185,7 @@ GET_ONLY_ROUTES = frozenset(
         "/api/events",
         "/api/files",
         "/api/file",
+        "/api/classify/status",
         "/favicon.ico",
     )
 )
@@ -551,7 +585,12 @@ _merge_lock = threading.Lock()
 
 
 class MergeRequestError(Exception):
-    """A request this endpoint refuses, with the status to refuse it with."""
+    """A request an endpoint refuses, with the status to refuse it with.
+
+    Named for the endpoint it was written for; /api/classify raises it too,
+    because "refuse this request with THIS status and THIS sentence, and never
+    a traceback" is the same contract at both.
+    """
 
     def __init__(self, status, message):
         Exception.__init__(self, message)
@@ -875,6 +914,231 @@ def merge_report(counts, received, elapsed, db_path: Path):
 
 
 # --------------------------------------------------------------------------
+# /api/classify -- the other write
+# --------------------------------------------------------------------------
+#
+# Exactly as /api/merge is a transport in front of audit_log.merge_databases(),
+# this is a transport in front of `audit_log.py classify-pending`. None of the
+# scope rules, none of the retry policy and none of the taxonomy live here:
+# the child decides all of it, and this file only starts it, remembers it, and
+# reads the two files it writes.
+#
+# A subprocess rather than the in-process import the merge uses, for the
+# opposite reason: a merge is one transaction of a few seconds, while a
+# classification run is minutes of blocking subprocess calls. Run in a request
+# thread it would hold a socket open past every reverse-proxy and browser
+# timeout there is, and a `serve` restart mid-run would abandon it half done
+# with no record. Detached, it survives the service and leaves its account on
+# disk either way.
+
+# One run at a time, process-wide -- two of them would classify the same rows
+# twice and spend double the model calls doing it. The lock guards the handle,
+# not the run: it is held only while the child is inspected or started.
+_classify_lock = threading.Lock()
+_classify_child = {
+    "proc": None,
+    "progress": None,
+    "result": None,
+    "started_at": None,
+    "redo_heuristic": False,
+}
+
+
+def classify_paths(db_path):
+    """(progress, result) sidecars for a database.
+
+    Beside the database, like the pidfile and hook-errors.log: they describe
+    THIS database's classification state, so moving the database moves them.
+    """
+    directory = Path(db_path).parent
+    return directory / CLASSIFY_PROGRESS_NAME, directory / CLASSIFY_RESULT_NAME
+
+
+def read_json_object(path):
+    """A small JSON sidecar as a dict, or None. Never raises.
+
+    A progress file that is missing, empty or (despite the atomic rewrite on
+    the writing side) unreadable is one tick of absent information, not an
+    error worth a 500.
+    """
+    try:
+        with Path(path).open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def count_pending_classifications(db_path: Path):
+    """{turns, agents, heuristic}: what a run would look at, right now."""
+    empty = {"turns": 0, "agents": 0, "heuristic": 0}
+    if not Path(db_path).is_file():
+        return empty
+    conn = None
+    try:
+        conn = open_readonly(Path(db_path))
+        turns = conn.execute(CLASSIFY_PENDING_TURNS_SQL).fetchone()[0]
+        agents = conn.execute(CLASSIFY_PENDING_AGENTS_SQL).fetchone()[0]
+        heuristic = conn.execute(CLASSIFY_HEURISTIC_SQL).fetchone()[0]
+    except sqlite3.Error:
+        return empty
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+    return {
+        "turns": int(turns or 0),
+        "agents": int(agents or 0),
+        "heuristic": int(heuristic or 0),
+    }
+
+
+def spawn_classify_child(db_path: Path, redo_heuristic: bool):
+    """Start `classify-pending` detached. Returns (proc, progress, result).
+
+    --no-fallback is not optional here and never will be: a button offered as
+    "properly summarise what was never properly summarised" must not answer by
+    writing more keyword guesses. A row the model cannot reach is left exactly
+    as it was and counted, and the next run finds it again.
+    """
+    if not AUDIT_LOG_SCRIPT.is_file():
+        raise MergeRequestError(503, "classifier is unavailable")
+
+    progress, result = classify_paths(db_path)
+    directory = Path(db_path).parent
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise MergeRequestError(500, "cannot write beside the audit database")
+    # Last run's account goes before this one starts, so a status poll that
+    # arrives before the child has written anything cannot read stale numbers
+    # as if they were this run's.
+    for stale in (progress, result, Path("{0}.tmp".format(progress))):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+    argv = [
+        sys.executable,
+        str(AUDIT_LOG_SCRIPT),
+        "classify-pending",
+        "--db",
+        str(db_path),
+        "--no-fallback",
+        "--progress-file",
+        str(progress),
+    ]
+    if redo_heuristic:
+        argv.append("--redo-heuristic")
+
+    env = dict(os.environ)
+    # The classifier's own headless `claude` runs would otherwise re-enter the
+    # audit hooks and log the audit classifying itself.
+    env["CLAUDE_AUDIT_SKIP"] = "1"
+    _, err_log = log_paths(str(db_path))
+
+    try:
+        out_fh = result.open("wb")
+    except OSError:
+        raise MergeRequestError(500, "cannot write the classifier result file")
+    try:
+        err_fh = err_log.open("a", encoding="utf-8")
+    except OSError:
+        err_fh = subprocess.DEVNULL
+    try:
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(directory),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=out_fh,
+            stderr=err_fh,
+            start_new_session=True,   # outlives a `service.py stop`
+        )
+    except OSError as exc:
+        log_error(audit_dir(), "classify: cannot start child: {0}".format(exc))
+        raise MergeRequestError(500, "classifier could not be started")
+    finally:
+        try:
+            out_fh.close()
+        except OSError:
+            pass
+        if err_fh is not subprocess.DEVNULL:
+            try:
+                err_fh.close()
+            except OSError:
+                pass
+    return proc, progress, result
+
+
+def classify_status(db_path: Path):
+    """{running, done, total, haiku, failed, error, detail} for the page.
+
+    Three sources, folded in the order they become true:
+
+      * the progress file, rewritten by the child after every committed row;
+      * the final JSON the child printed as it exited, which is read only once
+        the child is gone -- it is the authoritative version of the same
+        document and carries the cli_auth refusal, when there was one;
+      * whether the child is still alive, which is the only thing that can say
+        "working" about a run that is still in its auth probe and has
+        therefore written nothing at all.
+
+    Deliberately survives a service restart with no child handle: the files
+    are still there, so a run started before the restart is reported from its
+    own account rather than denied.
+    """
+    progress_path, result_path = classify_paths(db_path)
+    status = {
+        "running": False,
+        "done": 0,
+        "total": 0,
+        "haiku": 0,
+        "failed": 0,
+        "error": None,
+        "detail": None,
+    }
+    with _classify_lock:
+        proc = _classify_child.get("proc")
+        owned = proc is not None
+        alive = owned and proc.poll() is None
+        status["started_at"] = _classify_child.get("started_at")
+        status["redo_heuristic"] = bool(_classify_child.get("redo_heuristic"))
+
+    progress = read_json_object(progress_path)
+    # Only once the child is gone: a final file from the PREVIOUS run cannot
+    # exist (spawn deletes it), and a half-flushed one from this run would
+    # claim an ending that has not happened.
+    final = None if alive else read_json_object(result_path)
+
+    for payload in (progress, final):
+        if not payload:
+            continue
+        for key in ("done", "total", "haiku", "failed"):
+            value = payload.get(key)
+            if isinstance(value, int):
+                status[key] = value
+        for key in ("error", "detail", "phase"):
+            if payload.get(key):
+                status[key] = payload[key]
+        if payload.get("aborted"):
+            status["aborted"] = True
+
+    status["running"] = bool(alive)
+    if not alive and owned and final is None and progress is not None:
+        # The child vanished mid-run: killed, or the machine went down. Say so
+        # rather than presenting a frozen progress file as a finished run.
+        status["error"] = status["error"] or "classifier_stopped"
+        status["detail"] = (
+            status["detail"] or "the classifier exited without writing a result"
+        )
+    return status
+
+
+# --------------------------------------------------------------------------
 # HTTP
 # --------------------------------------------------------------------------
 
@@ -1015,17 +1279,21 @@ class AuditHandler(BaseHTTPRequestHandler):
             self._api_files(query)
         elif route == "/api/file":
             self._api_file(query)
+        elif route == "/api/classify/status":
+            self._send_json(200, classify_status(self.db_path))
         elif route == "/favicon.ico":
             self._send_bytes(200, "image/svg+xml", FAVICON_SVG)
-        elif route == "/api/merge":
+        elif route in ("/api/merge", "/api/classify"):
             self._send_method_not_allowed("POST")
         else:
             self._send_error_json(404, "no such endpoint")
 
     def _route_post(self, route):
-        """POST reaches exactly one endpoint. Everything else is refused."""
+        """POST reaches exactly two endpoints. Everything else is refused."""
         if route == "/api/merge":
             self._api_merge()
+        elif route == "/api/classify":
+            self._api_classify()
         elif route in GET_ONLY_ROUTES:
             self._send_method_not_allowed("GET, HEAD")
         else:
@@ -1377,6 +1645,88 @@ class AuditHandler(BaseHTTPRequestHandler):
             merge_report(
                 counts, received, time.monotonic() - started, self.db_path
             ),
+        )
+
+    def _read_json_body(self, limit):
+        """The request's JSON object, or {}. A body is optional here.
+
+        Small and read whole, unlike the merge upload: the only thing this
+        endpoint's body ever carries is a flag.
+        """
+        if (self.headers.get("Transfer-Encoding") or "").strip().lower():
+            raise MergeRequestError(411, "Content-Length is required")
+        raw = self.headers.get("Content-Length")
+        if raw is None:
+            return {}
+        try:
+            length = int(str(raw).strip())
+        except (TypeError, ValueError):
+            raise MergeRequestError(400, "Content-Length is not a number")
+        if length <= 0:
+            return {}
+        if length > limit:
+            raise MergeRequestError(413, "request body is too large")
+        body = self.rfile.read(length)
+        try:
+            payload = json.loads(body.decode("utf-8", "replace"))
+        except ValueError:
+            raise MergeRequestError(400, "body is not JSON")
+        if not isinstance(payload, dict):
+            raise MergeRequestError(400, "body is not a JSON object")
+        return payload
+
+    def _api_classify(self):
+        """Start a bulk tag+title run over everything still unclassified.
+
+        Answers 202 the moment the child is running -- the work itself takes
+        minutes and is followed at /api/classify/status. 409 when a run is
+        already going: the rows are the same rows, and two runs would just
+        spend the model calls twice.
+
+        The viewer needs no help noticing the results arrive: the child writes
+        each row on a connection of its own, which moves PRAGMA data_version
+        and the file's mtime, so the /api/events poller emits `db-change` on
+        its next tick exactly as it does for a hook's write. Nothing here
+        signals anything, deliberately.
+        """
+        self._reject_cross_site()
+        options = self._read_json_body(CLASSIFY_BODY_LIMIT)
+        redo = bool(options.get("redo_heuristic"))
+
+        # Before the spawn: the child starts consuming these rows immediately,
+        # and the number the caller is shown should be the number it faced.
+        pending = count_pending_classifications(self.db_path)
+
+        busy = False
+        with _classify_lock:
+            proc = _classify_child.get("proc")
+            if proc is not None and proc.poll() is None:
+                busy = True
+            else:
+                child, progress, result = spawn_classify_child(self.db_path, redo)
+                _classify_child.update(
+                    {
+                        "proc": child,
+                        "progress": progress,
+                        "result": result,
+                        "started_at": utcnow(),
+                        "redo_heuristic": redo,
+                    }
+                )
+        if busy:
+            self._send_json(
+                409,
+                {
+                    "error": "a classification run is already in progress",
+                    "status": 409,
+                    "running": True,
+                },
+            )
+            return
+
+        self._send_json(
+            202,
+            {"started": True, "redo_heuristic": redo, "pending": pending},
         )
 
 

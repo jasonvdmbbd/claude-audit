@@ -1,7 +1,7 @@
 {
   "name": "claude-audit",
   "description": "Corporate-transparency audit log: records every Claude Code prompt turn, tool call and subagent into a central machine-wide SQLite database, tags turns (plan/build/fix/validate/docs/ops/chat) with Haiku, and serves a live viewer with list + flow-chart views and rendered artifact browsing at http://127.0.0.1:4737/.",
-  "version": "3.2.1",
+  "version": "3.3.0",
   "author": {
     "name": "Jason van Dyk",
     "email": "jasonvd@bbd.co.za"

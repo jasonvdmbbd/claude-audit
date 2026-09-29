@@ -21,6 +21,10 @@ Invocation modes
     python3 audit_log.py classify [--db P] --turn N   tag+title one turn
     python3 audit_log.py classify [--db P] --agent SESSION:AGENT
                                           tag+title one subagent
+    python3 audit_log.py classify-pending [--db P] [--redo-heuristic]
+                        [--no-fallback] [--progress-file P]
+                                          tag+title EVERYTHING still unlabelled,
+                                          one row at a time, reporting progress
     python3 audit_log.py sync [--classify] [--db P] [--projects-dir D]
                                           backfill EVERY workspace found under
                                           the projects root (the default)
@@ -71,6 +75,15 @@ MAX_AGENT_TEXT_CHARS = 10_000   # per subagent prompt / result stored
 STRUCTURED_OUTPUT_TOOL = "StructuredOutput"
 TITLE_MAX_CHARS = 80
 SCHEMA_VERSION = "1"
+
+# The bulk classifier (`classify-pending`). The probe prompt is as small as a
+# real classification is not: it exists only to find out whether the local
+# `claude` CLI will answer, before a run that could spend minutes discovering
+# the same thing one row at a time. CLASSIFY_ABORT_AFTER is how many
+# CONSECUTIVE model failures mean the CLI is down rather than a row being odd.
+CLASSIFY_PROBE_PROMPT = "Reply with the single word: ok\n"
+CLASSIFY_ABORT_AFTER = 3
+CLASSIFY_DETAIL_CHARS = 300      # of an error detail reported to the caller
 
 DEFAULT_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
@@ -637,6 +650,12 @@ def classifier_workdir() -> Path:
 def truncate(text, limit):
     text = text or ""
     return text if len(text) <= limit else text[:limit]
+
+
+def one_line(text, limit):
+    """`text` collapsed to a single capped line -- for an error detail that
+    has to survive a JSON field and a status bar."""
+    return truncate(" ".join(str(text or "").split()), limit)
 
 
 def is_synthetic_prompt(text) -> bool:
@@ -2840,8 +2859,20 @@ def build_classify_prompt(prompt, response) -> str:
     )
 
 
-def classify_with_haiku(prompt, response):
-    """Ask Haiku for {tag, title}. Returns None on any failure."""
+def run_classifier_cli(prompt):
+    """One headless `claude` run with the classifier's plumbing.
+
+    Returns (envelope, detail): the parsed --output-format json envelope, or
+    (None, "<one line saying what went wrong>") when the CLI could not be run,
+    timed out, exited nonzero, answered something that is not a JSON envelope,
+    or reported is_error.
+
+    Split out of classify_with_haiku for the auth probe, which needs to know
+    whether the CLI answers AT ALL and does not care what it said. Everything
+    about the call -- the model, the timeout, the disposable cwd, the
+    CLAUDE_AUDIT_SKIP that stops the headless session re-entering these hooks
+    -- stays here, so the probe and a real classification are the same call.
+    """
     env = dict(os.environ)
     env["CLAUDE_AUDIT_SKIP"] = "1"
     try:
@@ -2849,7 +2880,7 @@ def classify_with_haiku(prompt, response):
         # transcript project directory.
         proc = subprocess.run(
             ["claude", "-p", "--model", HAIKU_MODEL, "--output-format", "json"],
-            input=build_classify_prompt(prompt, response),
+            input=prompt,
             cwd=str(classifier_workdir()),
             env=env,
             stdout=subprocess.PIPE,
@@ -2857,16 +2888,66 @@ def classify_with_haiku(prompt, response):
             timeout=CLASSIFY_TIMEOUT_S,
             text=True,
         )
-    except Exception:
-        return None
+    except Exception as exc:
+        return None, "claude could not be run: {0}".format(exc)
 
-    if proc.returncode != 0:
-        return None
+    # Parsed BEFORE the exit code is consulted, because the two failures that
+    # matter here report themselves in the envelope and not on stderr. An
+    # expired login is the clearest example, measured on this machine:
+    # exit 1, stderr empty, and stdout carrying
+    #   {"is_error": true, "result": "Failed to authenticate: OAuth session
+    #    expired and could not be refreshed", ...}
+    # Reading stderr first would report "claude exited 1:" and throw away the
+    # one sentence that tells the human what to do about it.
     try:
         envelope = json.loads(proc.stdout)
     except ValueError:
+        envelope = None
+    if not isinstance(envelope, dict):
+        envelope = None
+    said = one_line(envelope.get("result"), CLASSIFY_DETAIL_CHARS) if envelope else ""
+
+    if envelope is not None and envelope.get("is_error"):
+        return None, "claude reported an error: {0}".format(said or "(no detail)")
+    if proc.returncode != 0:
+        return None, "claude exited {0}: {1}".format(
+            proc.returncode,
+            said or one_line(proc.stderr, CLASSIFY_DETAIL_CHARS) or "(no detail)",
+        )
+    if envelope is None:
+        return None, "claude answered no JSON envelope"
+    return envelope, ""
+
+
+def probe_classifier():
+    """Prove the classifier CLI answers, before a bulk run touches anything.
+
+    Returns None when it does, or {"error", "detail"} when it does not. One
+    tiny fixed prompt: a thousand rows fed to a CLI whose login has expired is
+    a thousand identical failures, several minutes of subprocess churn and a
+    database full of nothing -- so the bulk path asks once, first, and stops.
+
+    CLAUDE_AUDIT_NO_LLM=1 fails the probe deliberately and under its own code:
+    in that mode every row would fail anyway, and a test gets a determinstic
+    answer without a network call.
+    """
+    if os.environ.get("CLAUDE_AUDIT_NO_LLM") == "1":
+        return {
+            "error": "no_llm_mode",
+            "detail": "CLAUDE_AUDIT_NO_LLM=1: the model call is disabled",
+        }
+    envelope, detail = run_classifier_cli(CLASSIFY_PROBE_PROMPT)
+    if envelope is not None:
         return None
-    if not isinstance(envelope, dict) or envelope.get("is_error"):
+    # Auth-shaped or not, the verdict is the same: a CLI that cannot answer a
+    # one-word prompt cannot classify a turn either. The detail says which.
+    return {"error": "cli_auth", "detail": detail or "claude did not answer"}
+
+
+def classify_with_haiku(prompt, response):
+    """Ask Haiku for {tag, title}. Returns None on any failure."""
+    envelope, _ = run_classifier_cli(build_classify_prompt(prompt, response))
+    if envelope is None:
         return None
 
     try:
@@ -2919,9 +3000,25 @@ def heuristic_classify(prompt, response, permission_mode, tool_calls=0):
     return {"tag": tag, "title": first_sentence(prompt)}
 
 
-def classify_turn(conn, turn_id):
+class ClassifyFailed(Exception):
+    """The model call failed and `fallback` forbade guessing instead.
+
+    Raised rather than returned so it cannot be confused with the other thing
+    a classifier returns nothing for -- "there is no such row" -- and so the
+    row is provably left exactly as it was: the UPDATE is never reached.
+    """
+
+
+def classify_turn(conn, turn_id, fallback=True):
     """Tag and title one turn in-process. Returns the stored result, or None
-    when there is no such turn."""
+    when there is no such turn.
+
+    `fallback=False` makes the model the only acceptable answer: a failed
+    Haiku call raises ClassifyFailed and the row is left untouched, rather
+    than being stamped with a keyword guess. That is what the bulk pass wants
+    -- a run started to REPLACE heuristic tags must not manufacture more of
+    them -- while every other caller keeps the always-answer behaviour.
+    """
     row = conn.execute(
         "SELECT prompt, response, permission_mode, is_synthetic FROM turns"
         " WHERE turn_id = ?",
@@ -2946,6 +3043,8 @@ def classify_turn(conn, turn_id):
             result = classify_with_haiku(prompt, response)
         if result is not None:
             source = "haiku"
+        elif not fallback:
+            raise ClassifyFailed("no classification for turn {0}".format(turn_id))
         else:
             # `chat` hinges on whether the turn actually did anything, which
             # the prompt text cannot say -- so the heuristic gets the count.
@@ -2964,7 +3063,7 @@ def classify_turn(conn, turn_id):
     return {"turn": turn_id, "tag_source": source, **result}
 
 
-def classify_agent(conn, session_id, agent_id):
+def classify_agent(conn, session_id, agent_id, fallback=True):
     """Tag and title one subagent, exactly as classify_turn does a turn.
 
     The subagent is put to the model as a turn -- its spawning instruction is
@@ -2973,6 +3072,9 @@ def classify_agent(conn, session_id, agent_id):
     are literally the same machinery, and an agent's tag is comparable with a
     turn's. There is no synthetic case: nothing spawns a subagent by accident.
     Returns the stored result, or None when there is no such agent.
+
+    `fallback=False` behaves exactly as it does for a turn: a failed model
+    call raises ClassifyFailed and this row is left as it was.
     """
     row = conn.execute(
         "SELECT prompt, result, description, tool_call_count FROM agents"
@@ -2993,6 +3095,10 @@ def classify_agent(conn, session_id, agent_id):
         result = classify_with_haiku(prompt, response)
     if result is not None:
         source = "haiku"
+    elif not fallback:
+        raise ClassifyFailed(
+            "no classification for agent {0}".format(agent_ref(session_id, agent_id))
+        )
     else:
         result = heuristic_classify(
             prompt, response, None, row["tool_call_count"] or 0
@@ -3037,6 +3143,242 @@ def cmd_classify(args) -> int:
         return 0
     finally:
         conn.close()
+
+
+# --------------------------------------------------------------------------
+# Bulk classification (`classify-pending`)
+# --------------------------------------------------------------------------
+#
+# `sync --classify` already sweeps untagged rows, but it does so at the end of
+# a full transcript re-read and it answers only in prose on stdout at the very
+# end. This subcommand is the same work with none of the rest of it: nothing
+# is re-parsed, nothing is archived, no cursor moves, and the only rows it can
+# reach are ones a model has never successfully labelled.
+#
+# It exists to be driven from a button (service.py POST /api/classify), which
+# dictates the three things that make it different from the sync's pass:
+#
+#   * IT PROBES FIRST. An expired `claude` login answers every call the same
+#     way. Discovering that a thousand times, one subprocess at a time, is the
+#     failure mode this command is designed not to have: one tiny call decides
+#     it, and a run that cannot classify anything changes nothing at all.
+#   * IT REPORTS AS IT GOES, into a progress file rewritten atomically after
+#     every committed row -- so a page polling it sees real movement, and a
+#     run killed halfway leaves a readable account of how far it got.
+#   * IT REFUSES TO GUESS (--no-fallback). The heuristic exists so that a live
+#     hook never leaves a row untagged; a deliberate catch-up pass wants the
+#     model or nothing, because a heuristic tag written here would be
+#     indistinguishable from the ones the run was started to replace.
+
+# The scope, as SQL. A turn is in scope when there is something to classify
+# (its response has been written: status != 'pending'), it is not machinery
+# (a synthetic prompt gets a deterministic system:* kind from synthetic_kind,
+# never a model), and it carries no tag. --redo-heuristic widens that last
+# clause to the rows a previous run could only guess at.
+#
+# service.py counts these same rows for its 202 response and keeps its copy of
+# the predicates textually identical -- see the note there.
+PENDING_TURNS_SQL = (
+    "SELECT turn_id FROM turns WHERE COALESCE(is_synthetic, 0) = 0"
+    " AND status != 'pending' AND ({0}) ORDER BY turn_id ASC"
+)
+PENDING_AGENTS_SQL = (
+    "SELECT session_id, agent_id FROM agents WHERE ({0})"
+    " ORDER BY ts_start ASC, agent_id ASC"
+)
+TAG_MISSING = "tag IS NULL"
+TAG_MISSING_OR_HEURISTIC = "tag IS NULL OR tag_source = 'heuristic'"
+
+
+def pending_clause(redo_heuristic) -> str:
+    return TAG_MISSING_OR_HEURISTIC if redo_heuristic else TAG_MISSING
+
+
+def write_progress(path, payload) -> None:
+    """Atomically replace the progress file with `payload`.
+
+    Written to <path>.tmp and os.replace()d into place, so a reader polling
+    the file on a timer can never catch it half-written -- it sees the
+    previous tick or this one, never a truncated JSON document.
+
+    Best-effort by design: a progress file that cannot be written is a missing
+    status bar, and a missing status bar is never a reason to stop
+    classifying. The database is the deliverable; this is commentary.
+    """
+    if not path:
+        return
+    try:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = Path("{0}.tmp".format(target))
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.replace(str(tmp), str(target))
+    except Exception:
+        pass
+
+
+def progress_payload(state, running):
+    """The status document, in the one shape both the progress file and the
+    final stdout line use -- so a reader parses them with the same code."""
+    return {
+        "running": bool(running),
+        "done": state["done"],
+        "total": state["total"],
+        "haiku": state["haiku"],
+        "failed": state["failed"],
+        "phase": state["phase"],
+    }
+
+
+def emit_classify_result(payload) -> None:
+    """The run's final word, on stdout. The caller redirects this to a file."""
+    json.dump(payload, sys.stdout)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def classify_one(conn, state, directory, run, label) -> bool:
+    """Run one classification and fold its verdict into `state`.
+
+    Returns False when the run must STOP: CLASSIFY_ABORT_AFTER consecutive
+    failures is the classifier CLI being down, not a row being strange, and
+    grinding the remaining thousand rows through it would take minutes to
+    reach the same conclusion. A single failure only advances the counters --
+    the row keeps whatever it had, including a heuristic tag that was being
+    re-attempted, so an aborted run is never worse than not having run.
+    """
+    try:
+        result = run()
+    except ClassifyFailed:
+        state["failed"] += 1
+        state["streak"] += 1
+    except Exception:
+        # One unreadable row never ends a sweep. The trail goes beside the
+        # database, exactly as finalize_db's per-row failures do.
+        log_error(
+            directory,
+            "classify-pending failed for {0}: {1}".format(
+                label, traceback.format_exc().replace("\n", " | ")
+            ),
+        )
+        state["failed"] += 1
+        state["streak"] += 1
+    else:
+        state["streak"] = 0
+        if result is not None and result.get("tag_source") == "haiku":
+            state["haiku"] += 1
+    state["done"] += 1
+    if state["streak"] >= CLASSIFY_ABORT_AFTER:
+        state["aborted"] = True
+        return False
+    return True
+
+
+def cmd_classify_pending(args) -> int:
+    """Tag and title every row a model has not successfully labelled yet.
+
+    Sequential on purpose: each row is a headless `claude` run, and a
+    machine-wide audit holding thousands of them must not fan that out.
+    """
+    # BEFORE the database is even opened: a CLI that cannot answer must cost
+    # nothing and change nothing, including a progress file.
+    failure = probe_classifier()
+    if failure is not None:
+        emit_classify_result(
+            {
+                "running": False,
+                "done": 0,
+                "total": 0,
+                "haiku": 0,
+                "failed": 0,
+                "phase": "probe",
+                "error": failure["error"],
+                "detail": failure["detail"],
+            }
+        )
+        return 1
+
+    db_path = default_db_path(args.db)
+    directory = db_path.parent
+    clause = pending_clause(args.redo_heuristic)
+    # The model is the only acceptable answer when --no-fallback is set; see
+    # classify_turn. The service always passes it.
+    fallback = not args.no_fallback
+
+    conn = open_db(db_path)
+    try:
+        turn_ids = [
+            row["turn_id"]
+            for row in conn.execute(PENDING_TURNS_SQL.format(clause)).fetchall()
+        ]
+        agent_refs = [
+            (row["session_id"], row["agent_id"])
+            for row in conn.execute(PENDING_AGENTS_SQL.format(clause)).fetchall()
+        ]
+        state = {
+            "done": 0,
+            "total": len(turn_ids) + len(agent_refs),
+            "haiku": 0,
+            "failed": 0,
+            "phase": "turns",
+            "streak": 0,
+            "aborted": False,
+        }
+        write_progress(args.progress_file, progress_payload(state, True))
+
+        # A --redo-heuristic row is NOT cleared up front. classify_turn /
+        # classify_agent overwrite tag, title and tag_source in one statement
+        # when they succeed, so the old value is replaced exactly when there
+        # is something to replace it with -- and a run aborted, killed or
+        # timed out halfway has demoted nothing.
+        for turn_id in turn_ids:
+            keep_going = classify_one(
+                conn,
+                state,
+                directory,
+                lambda t=turn_id: classify_turn(conn, t, fallback=fallback),
+                "turn {0}".format(turn_id),
+            )
+            # After the row's own commit (classify_turn commits its UPDATE),
+            # so the file never claims progress the database does not have.
+            write_progress(args.progress_file, progress_payload(state, True))
+            if not keep_going:
+                break
+
+        if not state["aborted"]:
+            state["phase"] = "agents"
+            for session_id, agent_id in agent_refs:
+                keep_going = classify_one(
+                    conn,
+                    state,
+                    directory,
+                    lambda s=session_id, a=agent_id: classify_agent(
+                        conn, s, a, fallback=fallback
+                    ),
+                    "agent {0}".format(agent_ref(session_id, agent_id)),
+                )
+                write_progress(args.progress_file, progress_payload(state, True))
+                if not keep_going:
+                    break
+    finally:
+        conn.close()
+
+    final = progress_payload(state, False)
+    if state["aborted"]:
+        final["aborted"] = True
+        final["error"] = "classifier_down"
+        final["detail"] = (
+            "{0} consecutive classifier failures; stopped with {1} of {2}"
+            " row(s) attempted".format(
+                CLASSIFY_ABORT_AFTER, state["done"], state["total"]
+            )
+        )
+    write_progress(args.progress_file, final)
+    emit_classify_result(final)
+    # A run that finished is a success even when some rows failed: those rows
+    # are untouched and the next run will find them again.
+    return 1 if state["aborted"] else 0
 
 
 # --------------------------------------------------------------------------
@@ -4621,6 +4963,31 @@ def run_subcommand(argv) -> int:
         help="one subagent, as agents.session_id:agents.agent_id",
     )
 
+    p_pending = sub.add_parser(
+        "classify-pending",
+        help="tag and title every turn and subagent still unclassified",
+    )
+    p_pending.add_argument("--db", default=None, help=DB_HELP)
+    p_pending.add_argument(
+        "--redo-heuristic",
+        action="store_true",
+        help="also re-attempt rows a previous run could only guess at"
+        " (tag_source = 'heuristic'); each is replaced only if the model"
+        " answers, so an aborted run demotes nothing",
+    )
+    p_pending.add_argument(
+        "--no-fallback",
+        action="store_true",
+        help="the model or nothing: a failed call leaves the row exactly as"
+        " it was instead of writing a keyword guess",
+    )
+    p_pending.add_argument(
+        "--progress-file",
+        default=None,
+        help="rewrite this file (atomically) with the run's counters after"
+        " every committed row",
+    )
+
     p_init = sub.add_parser("init", help="create or upgrade the schema")
     p_init.add_argument("--db", default=None, help=DB_HELP)
 
@@ -4667,6 +5034,7 @@ def run_subcommand(argv) -> int:
 
 SUBCOMMANDS = {
     "classify": cmd_classify,
+    "classify-pending": cmd_classify_pending,
     "init": cmd_init,
     "merge": cmd_merge,
     "sync": cmd_sync,
