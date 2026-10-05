@@ -963,6 +963,7 @@ table.dtable .swatch {
 
 /* "est." cost, wherever it appears: a turn row, a flow node, a usage panel. */
 .est { font-variant-numeric: tabular-nums; }
+.est.unpriced { color: var(--danger); font-weight: 600; cursor: help; }
 .turn-meta .est { color: var(--text-dim); font-weight: 600; }
 .costrow { margin-top: 8px; }
 .costrow .k { color: var(--text-faint); }
@@ -6564,11 +6565,35 @@ table.dtable .swatch {
     var tsExpr = "COALESCE(" + tc("ts_start", "''") + ", " + tc("ts_end", "''") + ", '')";
     var D = { notes: [] };
 
+    // --- by model (folded from the headline's own GROUP BY model scans) ----
+    // Raw model strings fold under normModel(), so the proxy's
+    // "vertex-ai/claude-haiku-4-5@20251001" and the first-party
+    // "claude-haiku-4-5-20251001" land on one "claude-haiku-4-5" row. Each
+    // raw group is still priced on its own by addGroup(), and every raw
+    // string is kept with where it came from, for the row's tooltip.
+    var mdStore = {}, mdOrder = [];
+    var mdRates = activeRates().map;
+    function foldModel(r, origin) {
+      var raw = (r.model === null || r.model === undefined) ? "" : String(r.model);
+      var key = normModel(raw) || "(no model recorded)";
+      var n = Number(r.n) || 0;
+      var b = groupInto(mdStore, mdOrder, key, r);
+      if (!b.variants) { b.variants = {}; b.vorder = []; }
+      var vk = raw || "(no model recorded)";
+      if (!b.variants[vk]) { b.variants[vk] = { turns: 0, agents: 0 }; b.vorder.push(vk); }
+      b.variants[vk][origin] += n;
+      if (origin === "agents") {
+        b.agents = (b.agents || 0) + n;
+        b.n -= n;   // n counts TURNS; agents are counted apart
+      }
+      if (rateFor(raw, mdRates)) b.anyPriced = true; else b.anyUnpriced = true;
+    }
+
     // --- 1. headline -----------------------------------------------------
     D.turns = bucket();
     safeQuery("SELECT COALESCE(" + tc("model", "''") + ", '') AS model, COUNT(*) AS n, " + tSums +
               " FROM turns t" + tWhere + " GROUP BY 1", T.params)
-      .forEach(function (r) { addGroup(D.turns, r); });
+      .forEach(function (r) { addGroup(D.turns, r); foldModel(r, "turns"); });
 
     var head = one("SELECT COUNT(DISTINCT t.session_id) AS sessions," +
                    " MIN(NULLIF(" + tsExpr + ", '')) AS first," +
@@ -6604,13 +6629,27 @@ table.dtable .swatch {
       safeQuery("SELECT COALESCE(" + ac("model", "''") + ", '') AS model, COUNT(*) AS n, " + aSums +
                 ", COALESCE(SUM(" + ac("tool_call_count", "0") + "), 0) AS tools" +
                 " FROM agents a" + aWhere + " GROUP BY 1", A.params)
-        .forEach(function (r) { addGroup(D.agents, r); D.agentTools += Number(r.tools) || 0; });
+        .forEach(function (r) {
+          addGroup(D.agents, r);
+          D.agentTools += Number(r.tools) || 0;
+          foldModel(r, "agents");
+        });
       D.agentCount = D.agents.n;
     } else {
       D.notes.push("No `agents` table: the sub-agent sections are unavailable in this database.");
     }
 
     D.all = mergeBucket(mergeBucket(bucket(), D.turns), D.agents);
+
+    // Priced rows by est. cost (then tokens); a model with no rate has no
+    // cost to order by, so it goes to the bottom, largest first.
+    mdOrder.forEach(function (b) { b.priced = !!b.anyPriced; });
+    mdOrder.sort(function (p, q) {
+      if (p.priced !== q.priced) return p.priced ? -1 : 1;
+      return (p.priced ? q.cost - p.cost : 0) || bucketTokens(q) - bucketTokens(p);
+    });
+    D.models = mdOrder;
+    D.modelCol = !!(turnCols.model || (hasAgents && agentCols.model));
 
     // --- 2. activity over time -------------------------------------------
     // The span is measured once; the buckets themselves come from
@@ -7093,6 +7132,7 @@ table.dtable .swatch {
     dashHeadline(host, D, R, p);
     dashTime(host, D, p);
     dashWorkspace(host, D, p);
+    dashModels(host, D, p);
     dashTags(host, D, p);
     dashTurnLevel(host, D, p);
     dashAgentLevel(host, D, p);
@@ -7350,6 +7390,158 @@ table.dtable .swatch {
             r.last ? fmtTime(r.last) : "—"
           ] };
         }));
+      return true;
+    });
+  }
+
+  // --- 3b. by model ------------------------------------------------------
+
+  // "raw string — 120 turns · 4 agents", one line per raw model string that
+  // folded into this row.
+  function modelVariantLines(r) {
+    return (r.vorder || []).map(function (v) {
+      var o = r.variants[v], bits = [];
+      if (o.turns) bits.push(num(o.turns) + (o.turns === 1 ? " turn" : " turns"));
+      if (o.agents) bits.push(num(o.agents) + (o.agents === 1 ? " agent" : " agents"));
+      return v + " — " + (bits.join(" · ") || "no rows");
+    });
+  }
+
+  function modelTip(r) {
+    var lines = modelVariantLines(r);
+    return (lines.length > 1 ? "Folds " + lines.length + " recorded model strings:\n"
+                             : "Recorded as:\n") + lines.join("\n");
+  }
+
+  function pctOf(part, whole) {
+    if (!whole || !isFinite(part / whole)) return "—";
+    var v = part / whole * 100;
+    if (v > 0 && v < 0.1) return "<0.1%";
+    return (v < 10 ? v.toFixed(1) : Math.round(v)) + "%";
+  }
+
+  function dashModels(host, D, p) {
+    var sec = dsection(host, "By model",
+      "turns and sub-agents, model ids normalised across providers");
+    if (!D.modelCol) {
+      sec.body.appendChild(el("p", "empty-note",
+        "This database records no model on turns or agents."));
+      return;
+    }
+    if (!D.models.length) {
+      sec.body.appendChild(el("p", "empty-note", "No turns or agents in this range."));
+      return;
+    }
+    var R = activeRates();
+    var rows = D.models;
+    var totTok = bucketTokens(D.all);
+    var totCost = D.all.cost;
+    var unpriced = rows.filter(function (r) { return !r.priced; });
+    var labels = rows.map(function (r) { return r.key + (r.priced ? "" : " (no rate)"); });
+
+    function noRateTip(r) {
+      return costTip("No rate for “" + r.key + "” in the " + R.label + " table, so its " +
+        compact(bucketTokens(r)) + " tokens are EXCLUDED from every cost figure — never counted as $0.");
+    }
+    function modelCost(r) {
+      if (!r.priced) {
+        var u = el("span", "est unpriced", "—");
+        u.title = noRateTip(r);
+        return u;
+      }
+      var s = costCell(r);
+      if (r.anyUnpriced && r.unpricedTokens) {
+        s.title = costTip("Partly unpriced: " + compact(r.unpricedTokens) +
+          " tokens of this model had no rate and are excluded.");
+      }
+      return s;
+    }
+
+    modeSeg(sec, "model", ["cost", "tokens", "table"], "cost", function (body, mode) {
+      if (mode === "cost" || mode === "tokens") {
+        var isCost = mode === "cost";
+        var ok = mkChart(body, {
+          type: "bar",
+          data: {
+            labels: labels,
+            datasets: isCost
+              ? [{ label: "est. cost",
+                   // null, not 0: an unpriced model draws no bar at all.
+                   data: rows.map(function (r) { return r.priced ? r.cost : null; }),
+                   backgroundColor: p.cost }]
+              : [
+                  { label: "input", data: rows.map(function (r) { return r.inp; }),
+                    backgroundColor: p.input, stack: "t" },
+                  { label: "output", data: rows.map(function (r) { return r.outp; }),
+                    backgroundColor: p.output, stack: "t" },
+                  { label: "cache read", data: rows.map(function (r) { return r.cr; }),
+                    backgroundColor: p.cacheRead, stack: "t" },
+                  { label: "cache write", data: rows.map(function (r) { return r.cw; }),
+                    backgroundColor: p.cacheWrite, stack: "t" }
+                ]
+          },
+          options: Object.assign(chartBase(p), {
+            indexAxis: "y",
+            scales: {
+              x: axis(p, isCost ? "est. cost (USD)" : "tokens", isCost ? costFmt : tokFmt,
+                      { beginAtZero: true, stacked: !isCost }),
+              y: axis(p, null, null, { stacked: !isCost, grid: { display: false } })
+            },
+            plugins: Object.assign(chartBase(p).plugins, {
+              legend: { display: !isCost,
+                        labels: { color: p.dim, boxWidth: 10, boxHeight: 10, font: { size: 11 } } },
+              tooltip: { callbacks: {
+                label: function (ctx) {
+                  var r = rows[ctx.dataIndex];
+                  if (isCost) {
+                    return "est. cost: " + fmtCost(ctx.parsed.x) +
+                      " (" + pctOf(r.cost, totCost) + " of est. total)";
+                  }
+                  return ctx.dataset.label + ": " + num(ctx.parsed.x) + " tok";
+                },
+                footer: function (items) {
+                  var r = items && items.length ? rows[items[0].dataIndex] : null;
+                  if (!r) return "";
+                  return [num(r.n) + " turns · " + num(r.agents || 0) + " agents · " +
+                          pctOf(bucketTokens(r), totTok) + " of tokens"]
+                    .concat(modelVariantLines(r));
+                }
+              } }
+            })
+          })
+        }, rows.length > 6);
+        if (ok && unpriced.length) {
+          var n = el("p", "dnote",
+            unpriced.length + (unpriced.length === 1 ? " model has" : " models have") +
+            " no rate in the " + R.label + " table and " +
+            (isCost ? "draw no cost bar" : "are counted in tokens only") +
+            " — excluded from cost, never $0.");
+          n.title = costTip();
+          body.appendChild(n);
+        }
+        return ok;
+      }
+      dtable(body,
+        ["model", "turns", "agents", "input", "output", "cache read", "cache write",
+         "thinking", "tokens", "% tokens", "est. cost", "% est. cost"],
+        rows.map(function (r) {
+          var lab = cell2(r.key, r.vorder && r.vorder.length > 1
+            ? r.vorder.length + " recorded ids" : null);
+          lab.title = modelTip(r);
+          var cp;
+          if (r.priced) { cp = el("span", "est", pctOf(r.cost, totCost)); cp.title = costTip(); }
+          else { cp = el("span", "est unpriced", "—"); cp.title = noRateTip(r); }
+          return { cells: [
+            lab, num(r.n), num(r.agents || 0),
+            compact(r.inp), compact(r.outp), compact(r.cr), compact(r.cw), compact(r.think),
+            compact(bucketTokens(r)), pctOf(bucketTokens(r), totTok),
+            modelCost(r), cp
+          ] };
+        }),
+        { note: "Ordered by est. cost under " + R.label + "; models with no rate go last and " +
+                "are never priced at $0. Thinking is already inside output, so it is not added " +
+                "to the token total. Turns and agents are counted separately; hover a model " +
+                "for the recorded ids it folds." });
       return true;
     });
   }
