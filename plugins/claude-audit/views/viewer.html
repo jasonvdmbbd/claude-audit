@@ -959,6 +959,15 @@ table.dtable .swatch {
 }
 .warnchip b { font-family: var(--mono); font-weight: 600; }
 
+/* Machinery rows (no model recorded): expected, so informational, not red. */
+.infochip {
+  display: block; font-size: 11.5px; color: var(--text-faint);
+  border: 1px dashed var(--border-strong); border-radius: var(--radius-sm);
+  padding: 5px 10px; margin-bottom: 10px; overflow-wrap: anywhere; cursor: help;
+}
+.est.machinery { color: var(--text-faint); cursor: help; }
+.calib-caveat { color: var(--text-dim); font-style: italic; }
+
 .dnote { font-size: 11.5px; color: var(--text-faint); margin: 8px 0 0; }
 
 /* "est." cost, wherever it appears: a turn row, a flow node, a usage panel. */
@@ -1104,6 +1113,7 @@ table.dtable .swatch {
         <select id="dash-provider" aria-label="Pricing provider">
           <option value="anthropic">Anthropic API</option>
           <option value="vertex_ai">Vertex AI</option>
+          <option value="litellm">LiteLLM (calibrated)</option>
           <option value="custom">Custom</option>
         </select>
         <select id="dash-endpoint" class="hidden" aria-label="Vertex AI endpoint">
@@ -1361,10 +1371,69 @@ table.dtable .swatch {
   };
 
   var RATE_KEYS = ["input", "output", "cache_read", "cache_write_5m", "cache_write_1h"];
-  var PROVIDER_LABEL = { anthropic: "Anthropic API", vertex_ai: "Vertex AI", custom: "Custom" };
+
+  // LiteLLM (calibrated). NOT a rate card: LiteLLM's proxy billed this
+  // workspace more than the Vertex global estimate, and no single structural
+  // explanation (regional ×1.1, different cache rates) reproduced its totals.
+  // So each model's Vertex GLOBAL rates — every component — are scaled by an
+  // empirical multiplier fitted to the real bill. The map is derived at load
+  // from PRICING.providers.vertex_ai, so a future edit to the Vertex table
+  // flows straight through; only the multipliers live here.
+  var LITELLM_CALIBRATION = {
+    as_of: "2026-10-05",
+    workspace: "/workspaces/JASON",
+    period: "23 Sep – 5 Oct 2026",
+    real_total: 378.74,            // USD, LiteLLM billing
+    est_total: 244.35,             // USD, this page's Vertex-global estimate, same scope
+    basis: "Vertex AI global",
+    multipliers: {
+      "claude-opus-4-6":   1.517,
+      "claude-opus-4-8":   1.737,
+      "claude-sonnet-4-6": 2.007,
+      "claude-haiku-4-5":  2.25
+    },
+    default_multiplier: 1.55,      // blended real/estimated ratio, for every other model
+    real_by_model: {               // USD, LiteLLM billing, for the provenance table
+      "claude-opus-4-6":   331.78,
+      "claude-opus-4-8":   29.48,
+      "claude-sonnet-4-6": 17.20,
+      "claude-haiku-4-5":  0.28
+    },
+    sample_notes: {
+      "claude-haiku-4-5": "tiny sample ($0.28 real) — low confidence"
+    },
+    notes: [
+      "Calibration, not a rate card: these rates are the Vertex AI GLOBAL rates scaled per model by multipliers fitted to real LiteLLM billing.",
+      "LiteLLM's billing did not match any single structural hypothesis (regional premium, cache-rate differences), so the multipliers are empirical.",
+      "Each multiplier is applied to all rate components (input, output, cache read, cache write 5m and 1h) and rounded to 4 decimals.",
+      "No endpoint toggle: the calibration already absorbs whatever endpoint LiteLLM routed to.",
+      "Models outside the fitted four use the blended overall ratio (×1.55). Re-calibrate when more billing data is available."
+    ]
+  };
+
+  function round4(v) { return Math.round(v * 10000) / 10000; }
+
+  function litellmMultiplier(model) {
+    var m = LITELLM_CALIBRATION.multipliers[model];
+    return (typeof m === "number" && isFinite(m) && m > 0) ? m : LITELLM_CALIBRATION.default_multiplier;
+  }
+
+  PRICING.providers.litellm = (function buildLitellmRates() {
+    var src = PRICING.providers.vertex_ai, out = {};
+    Object.keys(src).forEach(function (k) {
+      var mult = litellmMultiplier(k), o = {};
+      RATE_KEYS.forEach(function (f) { o[f] = round4((Number(src[k][f]) || 0) * mult); });
+      out[k] = o;
+    });
+    return out;
+  })();
+
+  var PROVIDER_LABEL = { anthropic: "Anthropic API", vertex_ai: "Vertex AI",
+                         litellm: "LiteLLM (calibrated)", custom: "Custom" };
+  function isProvider(p) { return p === "anthropic" || p === "vertex_ai" || p === "litellm"; }
 
   var pricing = {
-    provider: "anthropic",     // anthropic | vertex_ai | custom
+    provider: "anthropic",     // anthropic | vertex_ai | litellm | custom
     endpoint: "global",        // vertex only: global | regional
     seed: "anthropic",         // which provider a fresh custom table is copied from
     custom: null               // { model: {input, output, cache_read, cache_write_5m, cache_write_1h} }
@@ -1373,11 +1442,11 @@ table.dtable .swatch {
 
   (function restorePricing() {
     var p = store("cc-audit-price-provider");
-    if (p === "anthropic" || p === "vertex_ai" || p === "custom") pricing.provider = p;
+    if (isProvider(p) || p === "custom") pricing.provider = p;
     var e = store("cc-audit-price-endpoint");
     if (e === "global" || e === "regional") pricing.endpoint = e;
     var s = store("cc-audit-price-seed");
-    if (s === "anthropic" || s === "vertex_ai") pricing.seed = s;
+    if (isProvider(s)) pricing.seed = s;
     var c = store("cc-audit-price-custom");
     if (c) {
       var parsed = sanitizeRateMap(c);
@@ -1446,6 +1515,14 @@ table.dtable .swatch {
         label = "Vertex AI · global";
         detail = "Vertex AI global endpoint";
       }
+    } else if (pricing.provider === "litellm") {
+      // Already derived (vertex global × multiplier); the endpoint toggle
+      // does not apply — the calibration absorbs it.
+      base = PRICING.providers.litellm;
+      label = "LiteLLM (calibrated)";
+      detail = "LiteLLM (calibrated): Vertex AI global rates × per-model multipliers fitted to real " +
+        "LiteLLM billing for " + LITELLM_CALIBRATION.workspace + ", " + LITELLM_CALIBRATION.period +
+        " — a calibration, not a rate card";
     } else {
       base = PRICING.providers.anthropic;
       label = "Anthropic API";
@@ -1463,8 +1540,20 @@ table.dtable .swatch {
 
   // The rate table a fresh Custom map is copied from.
   function seedRateMap() {
-    var p = (pricing.seed === "vertex_ai") ? "vertex_ai" : "anthropic";
+    var p = isProvider(pricing.seed) ? pricing.seed : "anthropic";
     return cloneRateMap(PRICING.providers[p]);
+  }
+
+  // Rows that are harness machinery rather than a model call: the CLI's
+  // "<synthetic>" placeholder, or no model recorded at all. They are not a
+  // missing rate — there is nothing to price — so they get a neutral note,
+  // never the red "no rate" warning, and are still excluded from every sum.
+  var MACHINERY_KEY = "(no model · machinery)";
+  function isMachineryModel(m) {
+    if (m === null || m === undefined) return true;
+    var s = String(m).trim().toLowerCase();
+    return s === "" || s === "<synthetic>" || s === "null" ||
+           s === "(no model recorded)" || s === MACHINERY_KEY;
   }
 
   // DB model strings -> the keys of the rate maps. Region prefixes, Bedrock
@@ -1488,6 +1577,7 @@ table.dtable .swatch {
   }
 
   function rateFor(model, map) {
+    if (isMachineryModel(model)) return null;
     var s = normModel(model);
     if (!s) return null;
     var best = null, bestLen = -1;
@@ -1550,16 +1640,24 @@ table.dtable .swatch {
 
   // Two decimals unless the rate genuinely needs a third (0.125, and the
   // ×1.1 Vertex regional rates), so a column of rates lines up.
+  // The LiteLLM-calibrated rates carry up to 4 decimals (0.7585), so a rate
+  // gets as many as it needs, from 2 up to 4.
   function fmtRate(v) {
     var n = Number(v) || 0;
-    var d = (Math.round(n * 100) / 100 === n) ? 2 : 3;
+    var d = 2;
+    while (d < 4 && Math.round(n * Math.pow(10, d)) / Math.pow(10, d) !== n) d++;
     return "$" + n.toFixed(d) + "/MTok";
   }
 
   // "…as published <date>" is true of the researched tables and false of a
   // hand-edited one, so it is only ever appended to the researched ones.
   function ratesAsOf() {
-    return pricing.provider === "custom" ? "" : " (rates as published " + PRICING.as_of + ")";
+    if (pricing.provider === "custom") return "";
+    if (pricing.provider === "litellm") {
+      return " (Vertex rates as published " + PRICING.as_of + ", calibrated " +
+        LITELLM_CALIBRATION.as_of + ")";
+    }
+    return " (rates as published " + PRICING.as_of + ")";
   }
 
   // The one explanation, shared by every "est." figure on the page.
@@ -1627,6 +1725,12 @@ table.dtable .swatch {
 
     if (!c.priced) {
       if (!c.total) return;
+      if (isMachineryModel(model)) {
+        host.appendChild(el("p", "dnote",
+          "No model recorded for this row (harness machinery), so its " + compact(c.total) +
+          " tokens are not priced and are left out of every cost figure."));
+        return;
+      }
       var warn = el("p", "dnote",
         "No rate for model “" + (c.model || "(none recorded)") + "” in the " + R.label +
         " table, so " + compact(c.total) + " tokens are left out of every cost figure on this page.");
@@ -6505,7 +6609,8 @@ table.dtable .swatch {
 
   function bucket() {
     return { n: 0, inp: 0, outp: 0, cr: 0, cw: 0, think: 0,
-             cost: 0, savings: 0, pricedTokens: 0, unpricedTokens: 0, unpriced: {} };
+             cost: 0, savings: 0, pricedTokens: 0, unpricedTokens: 0, unpriced: {},
+             machineryTokens: 0, machineryRows: 0 };
   }
 
   // Folds one GROUP BY row — which always carries `model` — into a bucket.
@@ -6521,6 +6626,10 @@ table.dtable .swatch {
                       cache_read_tokens: cr, cache_creation_tokens: cw }, row.model);
     if (c.priced) {
       b.cost += c.cost; b.savings += c.savings; b.pricedTokens += c.total;
+    } else if (c.total && isMachineryModel(row.model)) {
+      // Not a missing rate: nothing to price. Counted apart, excluded from cost.
+      b.machineryTokens += c.total;
+      b.machineryRows += Number(row.n) || 0;
     } else if (c.total) {
       b.unpricedTokens += c.total;
       var k = (row.model === null || row.model === undefined || row.model === "")
@@ -6537,6 +6646,7 @@ table.dtable .swatch {
     dst.cr += src.cr; dst.cw += src.cw; dst.think += src.think;
     dst.cost += src.cost; dst.savings += src.savings;
     dst.pricedTokens += src.pricedTokens; dst.unpricedTokens += src.unpricedTokens;
+    dst.machineryTokens += src.machineryTokens || 0; dst.machineryRows += src.machineryRows || 0;
     Object.keys(src.unpriced).forEach(function (k) {
       dst.unpriced[k] = (dst.unpriced[k] || 0) + src.unpriced[k];
     });
@@ -6575,9 +6685,11 @@ table.dtable .swatch {
     var mdRates = activeRates().map;
     function foldModel(r, origin) {
       var raw = (r.model === null || r.model === undefined) ? "" : String(r.model);
-      var key = normModel(raw) || "(no model recorded)";
+      var mach = isMachineryModel(raw);
+      var key = mach ? MACHINERY_KEY : (normModel(raw) || MACHINERY_KEY);
       var n = Number(r.n) || 0;
       var b = groupInto(mdStore, mdOrder, key, r);
+      if (mach) b.machinery = true;
       if (!b.variants) { b.variants = {}; b.vorder = []; }
       var vk = raw || "(no model recorded)";
       if (!b.variants[vk]) { b.variants[vk] = { turns: 0, agents: 0 }; b.vorder.push(vk); }
@@ -6643,8 +6755,10 @@ table.dtable .swatch {
 
     // Priced rows by est. cost (then tokens); a model with no rate has no
     // cost to order by, so it goes to the bottom, largest first.
-    mdOrder.forEach(function (b) { b.priced = !!b.anyPriced; });
+    // The machinery bucket (no model recorded) sorts after everything.
+    mdOrder.forEach(function (b) { b.priced = !!b.anyPriced; b.machinery = !!b.machinery; });
     mdOrder.sort(function (p, q) {
+      if (p.machinery !== q.machinery) return p.machinery ? 1 : -1;
       if (p.priced !== q.priced) return p.priced ? -1 : 1;
       return (p.priced ? q.cost - p.cost : 0) || bucketTokens(q) - bucketTokens(p);
     });
@@ -7129,6 +7243,20 @@ table.dtable .swatch {
       host.appendChild(chip);
     }
 
+    // Machinery rows (model "<synthetic>" / none recorded): not a missing
+    // rate, so a neutral note rather than the red warning. Still excluded.
+    if (D.all.machineryTokens) {
+      var mrows = D.all.machineryRows;
+      var info = el("div", "infochip",
+        num(mrows) + " machinery " + (mrows === 1 ? "row" : "rows") + " (" +
+        compact(D.all.machineryTokens) + " tokens) " + (mrows === 1 ? "has" : "have") +
+        " no model recorded and " + (mrows === 1 ? "is" : "are") + " not priced.");
+      info.title = "Harness bookkeeping rows — model “<synthetic>” or no model at all. " +
+        "There is no model call to price, so they are left out of every cost figure " +
+        "(never counted as $0). This is expected, not a missing rate.";
+      host.appendChild(info);
+    }
+
     dashHeadline(host, D, R, p);
     dashTime(host, D, p);
     dashWorkspace(host, D, p);
@@ -7150,7 +7278,10 @@ table.dtable .swatch {
 
   function dashHeadline(host, D, R, p) {
     var sec = dsection(host, "Headline",
-      R.label + (pricing.provider === "custom" ? " rate table" : " · rates as published " + PRICING.as_of));
+      R.label + (pricing.provider === "custom" ? " rate table"
+        : pricing.provider === "litellm"
+          ? " · Vertex global × calibration of " + LITELLM_CALIBRATION.as_of + " (not a rate card)"
+          : " · rates as published " + PRICING.as_of));
     var box = el("div", "dtiles");
     sec.body.appendChild(box);
     var all = D.all;
@@ -7436,14 +7567,31 @@ table.dtable .swatch {
     var rows = D.models;
     var totTok = bucketTokens(D.all);
     var totCost = D.all.cost;
-    var unpriced = rows.filter(function (r) { return !r.priced; });
-    var labels = rows.map(function (r) { return r.key + (r.priced ? "" : " (no rate)"); });
+    // Real model ids with no rate (red) vs. the machinery bucket (neutral).
+    var unpriced = rows.filter(function (r) { return !r.priced && !r.machinery; });
+    var machinery = rows.filter(function (r) { return r.machinery; });
+    var labels = rows.map(function (r) {
+      return r.machinery ? "(no model · not priced)"
+        : r.key + (r.priced ? "" : " (no rate)");
+    });
 
+    function machineryTip(r) {
+      return "Harness machinery — model “<synthetic>” or no model recorded. There is no model " +
+        "call to price, so its " + compact(bucketTokens(r)) + " tokens are left out of every " +
+        "cost figure (never counted as $0). Expected, not a missing rate.";
+    }
     function noRateTip(r) {
+      if (r.machinery) return machineryTip(r);
       return costTip("No rate for “" + r.key + "” in the " + R.label + " table, so its " +
         compact(bucketTokens(r)) + " tokens are EXCLUDED from every cost figure — never counted as $0.");
     }
+    function noCostSpan(r) {
+      var u = el("span", r.machinery ? "est machinery" : "est unpriced", "—");
+      u.title = noRateTip(r);
+      return u;
+    }
     function modelCost(r) {
+      if (!r.priced && r.machinery) return noCostSpan(r);
       if (!r.priced) {
         var u = el("span", "est unpriced", "—");
         u.title = noRateTip(r);
@@ -7519,6 +7667,14 @@ table.dtable .swatch {
           n.title = costTip();
           body.appendChild(n);
         }
+        if (ok && machinery.length) {
+          var mt = machinery.reduce(function (s, r) { return s + bucketTokens(r); }, 0);
+          var mn = el("p", "dnote",
+            "The machinery row (" + compact(mt) + " tokens, no model recorded) is not priced" +
+            (isCost ? " and draws no cost bar." : "; it is counted in tokens only."));
+          mn.title = machineryTip(machinery[0]);
+          body.appendChild(mn);
+        }
         return ok;
       }
       dtable(body,
@@ -7530,7 +7686,7 @@ table.dtable .swatch {
           lab.title = modelTip(r);
           var cp;
           if (r.priced) { cp = el("span", "est", pctOf(r.cost, totCost)); cp.title = costTip(); }
-          else { cp = el("span", "est unpriced", "—"); cp.title = noRateTip(r); }
+          else cp = noCostSpan(r);
           return { cells: [
             lab, num(r.n), num(r.agents || 0),
             compact(r.inp), compact(r.outp), compact(r.cr), compact(r.cw), compact(r.think),
@@ -7539,7 +7695,8 @@ table.dtable .swatch {
           ] };
         }),
         { note: "Ordered by est. cost under " + R.label + "; models with no rate go last and " +
-                "are never priced at $0. Thinking is already inside output, so it is not added " +
+                "are never priced at $0; machinery rows with no model recorded come after them, " +
+                "unpriced. Thinking is already inside output, so it is not added " +
                 "to the token total. Turns and agents are counted separately; hover a model " +
                 "for the recorded ids it folds." });
       return true;
@@ -7919,6 +8076,45 @@ table.dtable .swatch {
     PRICING.notes.forEach(function (n) { ul.appendChild(el("li", null, n)); });
     host.appendChild(ul);
 
+    // LiteLLM provenance: shown for the calibrated provider, and for a Custom
+    // table that was seeded from it (whose numbers may since have been edited).
+    if (pricing.provider === "litellm" ||
+        (pricing.provider === "custom" && pricing.seed === "litellm")) {
+      var C = LITELLM_CALIBRATION;
+      host.appendChild(el("h4", null, "LiteLLM calibration — a calibration, not a rate card"));
+      if (pricing.provider === "custom") {
+        host.appendChild(el("p", "dnote",
+          "Your Custom table was seeded from these calibrated rates; any edits since are yours."));
+      }
+      var ratio = C.est_total ? C.real_total / C.est_total : 0;
+      function usd2(v) { return "$" + Number(v).toFixed(2); }
+      host.appendChild(el("p", null,
+        "Calibrated " + C.as_of + " against real LiteLLM billing for workspace " + C.workspace +
+        ", " + C.period + ": real total " + usd2(C.real_total) + " vs. this page's " + C.basis +
+        " estimate " + usd2(C.est_total) + " for the same scope (overall ×" + ratio.toFixed(3) + ")."));
+      host.appendChild(el("p", "calib-caveat",
+        "These multipliers are empirical. LiteLLM's billing did not match any single structural " +
+        "explanation (regional premium, cache-rate differences), so each model's Vertex global " +
+        "rates are simply scaled to reproduce the real bill. Treat the result as a calibration, " +
+        "not as a published price list."));
+      var mHost = el("div");
+      host.appendChild(mHost);
+      var mRows = Object.keys(C.multipliers).map(function (k) {
+        var real = C.real_by_model[k];
+        return { cells: [k, "×" + C.multipliers[k],
+                         typeof real === "number" ? usd2(real) : "—",
+                         C.sample_notes[k] || ""] };
+      });
+      mRows.push({ cells: ["every other model", "×" + C.default_multiplier, "—",
+                           "blended overall ratio"] });
+      dtable(mHost, ["model", "multiplier (all components)", "real LiteLLM billed", "note"], mRows,
+        { note: "Applied to the Vertex AI global input, output, cache read and cache write rates; " +
+                "derived at load from the Vertex table, rounded to 4 decimals." });
+      var cul = el("ul");
+      C.notes.forEach(function (n) { cul.appendChild(el("li", null, n)); });
+      host.appendChild(cul);
+    }
+
     var R = activeRates();
     host.appendChild(el("p", null, "In force now: " + R.detail + "."));
 
@@ -7987,7 +8183,9 @@ table.dtable .swatch {
         onPricingChanged();
         editor();
         stateLbl.className = "state";
-        stateLbl.textContent = "Reset to the researched " + (PROVIDER_LABEL[pricing.seed] || "Anthropic") + " rates.";
+        stateLbl.textContent = "Reset to the " +
+          (pricing.seed === "litellm" ? "calibrated " : "researched ") +
+          (PROVIDER_LABEL[pricing.seed] || "Anthropic") + " rates.";
       });
       row.appendChild(reset);
 
@@ -8105,7 +8303,7 @@ table.dtable .swatch {
   // rebuilds whichever one is on screen, not just the dashboard.
   $("dash-provider").addEventListener("change", function (e) {
     var v = e.target.value;
-    pricing.provider = (v === "vertex_ai" || v === "custom") ? v : "anthropic";
+    pricing.provider = (isProvider(v) || v === "custom") ? v : "anthropic";
     if (pricing.provider !== "custom") pricing.seed = pricing.provider;
     if (pricing.provider === "custom" && !pricing.custom) pricing.custom = seedRateMap();
     onPricingChanged();

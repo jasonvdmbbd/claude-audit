@@ -1443,6 +1443,29 @@ def new_turn(obj, byte_offset):
     }
 
 
+def clean_model(value):
+    """A model id worth storing, or None.
+
+    Claude Code writes harness-generated assistant lines -- "API Error: ...",
+    "No response requested.", an interrupt notice -- with message.model set to
+    the placeholder "<synthetic>" and an all-zero usage object. That names no
+    model: no API call was made, so it must never be stored as the turn's (or
+    agent's) model. Any <angle-bracketed> id is treated the same way, so a
+    future placeholder of the same shape cannot leak into the cost figures.
+    """
+    if not isinstance(value, str):
+        return None
+    model = value.strip()
+    if not model or (model.startswith("<") and model.endswith(">")):
+        return None
+    return model
+
+
+def response_model(message):
+    """The model that actually produced this assistant line, or None."""
+    return clean_model(message.get("model")) if isinstance(message, dict) else None
+
+
 def add_usage(turn, obj, message) -> None:
     """Accumulate token usage, counting each API response exactly once.
 
@@ -1543,8 +1566,11 @@ def absorb(turn, obj) -> None:
     content = message.get("content")
 
     if obj.get("type") == "assistant":
-        if message.get("model"):
-            turn["model"] = message["model"]
+        # A trailing "<synthetic>" line (an API error, an interrupt) must not
+        # overwrite the model the turn's real responses came from.
+        model = response_model(message)
+        if model:
+            turn["model"] = model
         add_usage(turn, obj, message)
         if isinstance(content, list):
             for block in content:
@@ -2057,8 +2083,9 @@ def parse_agent_file(path):
                             attach_tool_result(acc, block)
             elif kind == "assistant":
                 assistants.append(obj)
-                if message.get("model"):
-                    record["model"] = message["model"]
+                model = response_model(message)
+                if model:
+                    record["model"] = model
                 add_usage(acc, obj, message)
                 if isinstance(content, list):
                     for block in content:
@@ -2182,7 +2209,7 @@ def store_agent(conn, session_id, path, workflow_id) -> str:
     values["workflow_id"] = workflow_id
     values["agent_type"] = meta.get("agentType")
     values["description"] = meta.get("description") or meta.get("label")
-    values["model"] = record["model"] or meta.get("model")
+    values["model"] = record["model"] or clean_model(meta.get("model"))
     values["prompt"] = truncate(record["prompt"], MAX_AGENT_TEXT_CHARS)
     values["result"] = truncate(record["result"], MAX_AGENT_TEXT_CHARS)
     values["ts_start"] = record["ts_start"]
@@ -3523,6 +3550,169 @@ def relink_turns(conn, session_id, path) -> int:
     return relinked
 
 
+# A stored model that names nothing: never captured, or the "<synthetic>"
+# placeholder (see clean_model) that older releases stored verbatim.
+STALE_MODEL_SQL = "(model IS NULL OR TRIM(model) = '' OR model LIKE '<%>')"
+# Rows with real usage -- the ones a missing model drops out of every cost.
+HAS_TOKENS_SQL = (
+    "(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)"
+    " + COALESCE(cache_read_tokens, 0) + COALESCE(cache_creation_tokens, 0)"
+    " + COALESCE(thinking_tokens, 0)) > 0"
+)
+
+
+def session_models(path):
+    """{prompt_uuid: model} for every turn in a transcript, in one light pass.
+
+    Turn boundaries and absorbed lines are exactly assemble_turns' (the same
+    classify_line verdicts, the same isMeta / user-assistant filter), and the
+    model is the same last-real-response-wins value absorb() records -- but
+    nothing else is kept, so a large transcript costs one streamed pass.
+    """
+    models = {}
+    current = None
+    open_turn = False
+    pending = []
+    for obj in iter_transcript_objects(path):
+        verdict, _ = classify_line(obj, pending, open_turn)
+        if verdict == "skip":
+            continue
+        if verdict == "start":
+            open_turn = True
+            current = obj.get("uuid")
+            continue
+        if verdict != "line" or current is None:
+            continue
+        if obj.get("isMeta") or obj.get("type") != "assistant":
+            continue
+        model = response_model(obj.get("message"))
+        if model:
+            models[current] = model
+    return models
+
+
+def agent_file_model(path):
+    """The model an agent transcript's real responses came from, or None.
+
+    Same last-real-response-wins rule parse_agent_file applies, with the
+    meta.json sidecar as the fallback store_agent uses.
+    """
+    model = None
+    for obj in iter_transcript_objects(path):
+        if obj.get("type") == "assistant":
+            found = response_model(obj.get("message"))
+            if found:
+                model = found
+    return model or clean_model(read_agent_meta(path).get("model"))
+
+
+def recover_models(conn, session_id, path, directory) -> int:
+    """Give one session's model-less rows the model their transcript names.
+
+    Rows stored by an older release can carry model '<synthetic>' (a trailing
+    harness line overwrote the real model) or no model at all while holding
+    real token usage -- which drops them out of every cost figure. Turns are
+    matched by prompt_uuid against a fresh in-memory walk of the session
+    transcript; agents against their own subagent JSONL.
+
+    Cursor-free and idempotent, like relink_turns: the cursors table is
+    neither read nor written, only `model` is touched, only rows still stale
+    are updated, and a second run finds nothing to do. A row whose source is
+    gone, or whose transcript truly names no model, is left for finalize_db
+    to normalise ('<synthetic>' -> NULL). Never raises: a failure is logged
+    and costs only this pass, never the rest of the session's sync.
+    Returns the number of rows that received a real model.
+    """
+    recovered = 0
+    try:
+        conn.execute("SAVEPOINT recover_models")
+        try:
+            turns = conn.execute(
+                "SELECT turn_id, prompt_uuid FROM turns WHERE session_id = ?"
+                " AND prompt_uuid IS NOT NULL AND {0} AND {1}".format(
+                    STALE_MODEL_SQL, HAS_TOKENS_SQL
+                ),
+                (session_id,),
+            ).fetchall()
+            if turns:
+                models = session_models(path)
+                for row in turns:
+                    model = models.get(row["prompt_uuid"])
+                    if not model:
+                        continue
+                    recovered += conn.execute(
+                        "UPDATE turns SET model = ? WHERE turn_id = ?"
+                        " AND {0}".format(STALE_MODEL_SQL),
+                        (model, row["turn_id"]),
+                    ).rowcount
+
+            agents = conn.execute(
+                "SELECT agent_id FROM agents WHERE session_id = ?"
+                " AND {0} AND {1}".format(STALE_MODEL_SQL, HAS_TOKENS_SQL),
+                (session_id,),
+            ).fetchall()
+            if agents:
+                root = subagents_dir(path, session_id)
+                files = {
+                    agent_id_for(file): file
+                    for file, _ in (agent_files(root) if root is not None else [])
+                }
+                for row in agents:
+                    file = files.get(row["agent_id"])
+                    if file is None:
+                        continue
+                    # One unreadable agent file must cost only its own row,
+                    # never roll back the whole session's recoveries.
+                    try:
+                        model = agent_file_model(file)
+                    except Exception:
+                        log_error(
+                            directory,
+                            "model recovery skipped unreadable agent {0}/{1}".format(
+                                session_id, row["agent_id"]
+                            ),
+                        )
+                        continue
+                    if not model:
+                        continue
+                    recovered += conn.execute(
+                        "UPDATE agents SET model = ? WHERE session_id = ?"
+                        " AND agent_id = ? AND {0}".format(STALE_MODEL_SQL),
+                        (model, session_id, row["agent_id"]),
+                    ).rowcount
+        except Exception:
+            conn.execute("ROLLBACK TO recover_models")
+            raise
+        finally:
+            conn.execute("RELEASE recover_models")
+    except Exception:
+        log_error(
+            directory,
+            "model recovery failed for {0}: {1}".format(
+                session_id, traceback.format_exc().replace("\n", " | ")
+            ),
+        )
+        return 0
+    return recovered
+
+
+def normalize_placeholder_models(conn) -> int:
+    """Replace any stored '<synthetic>'-style placeholder with NULL, DB-wide.
+
+    Runs after every session's recover_models, so what is left is a row whose
+    source transcript is gone (or truly names no model): it stays as it is,
+    except that a placeholder no longer masquerades as a model id that every
+    rate table then fails to price. Idempotent. Returns rows changed.
+    """
+    changed = 0
+    for table in ("turns", "agents"):
+        changed += conn.execute(
+            "UPDATE {0} SET model = NULL WHERE model LIKE '<%>'".format(table)
+        ).rowcount
+    conn.commit()
+    return changed
+
+
 def renumber_tool_calls(conn, turn_id, turn) -> None:
     """Re-seq a turn's tool calls into the order the transcript really has.
 
@@ -3762,6 +3952,10 @@ def sync_session(conn, session_id, path, workspace, directory):
         # Last, and cursor-free: whatever the rest of the sweep did or skipped,
         # every turn row that exists for this session now gets its lineage.
         counts["relinked"] = relink_turns(conn, session_id, path)
+        # After everything that writes turns and agents, so it only sees rows
+        # still model-less once this pass's own (fixed) extraction is done.
+        # Cursor-free and never raises, like the relink above.
+        counts["recovered"] = recover_models(conn, session_id, path, directory)
     return counts, agent_counts, meta, existing is None
 
 
@@ -3773,6 +3967,7 @@ TURN_TOTAL_KEYS = (
     "reclassified",
     "relinked",
     "repaired",
+    "recovered",
 )
 
 PROBE_FILES = 3      # newest transcripts consulted when recovering a cwd
@@ -4066,13 +4261,26 @@ def finalize_db(conn, directory, classify):
     """Whole-database passes that run once per database, after the mirroring.
 
     One database serves every workspace, so these run once at the end of the
-    sync rather than once per workspace. Returns {remarked, task_links,
-    tool_tags, classified}.
+    sync rather than once per workspace. Returns {remarked, models_cleared,
+    task_links, tool_tags, classified}.
     """
     # Rows written before synthetic marking existed (or before a marker
     # or system:* kind was added) converge here: every machine-generated
     # prompt is re-flagged and given its deterministic kind + title,
     # replacing any tag a classifier mistakenly assigned to machinery.
+    # After every session's recover_models: whatever placeholder model is
+    # still stored had no transcript to recover from. Never fails the sync.
+    try:
+        models_cleared = normalize_placeholder_models(conn)
+    except Exception:
+        models_cleared = 0
+        log_error(
+            directory,
+            "model normalisation failed: {0}".format(
+                traceback.format_exc().replace("\n", " | ")
+            ),
+        )
+
     remarked = 0
     for row in conn.execute(
         "SELECT turn_id, prompt, tag, tag_source, is_synthetic FROM turns"
@@ -4157,6 +4365,7 @@ def finalize_db(conn, directory, classify):
                 classified["agents"] += 1
     return {
         "remarked": remarked,
+        "models_cleared": models_cleared,
         "task_links": task_links,
         "tool_tags": tool_tags,
         "classified": classified,
@@ -4203,6 +4412,8 @@ def print_workspace_summary(out, summary) -> None:
         out(
             "  repaired:    {0} phantom turn(s) merged\n".format(totals["repaired"])
         )
+    if totals["recovered"]:
+        out("  models recovered: {0}\n".format(totals["recovered"]))
     if summary["remarked"]:
         out(
             "  re-marked:   {0} turn(s) assigned a system:* kind\n".format(
@@ -4381,7 +4592,13 @@ def cmd_sync(args) -> int:
     out("  repaired:      {0} phantom turn(s) merged\n".format(
         totals["repaired"]
     ))
+    out("  models recovered: {0}\n".format(totals["recovered"]))
     if footer is not None:
+        if footer.get("models_cleared"):
+            out(
+                "  models cleared: {0} placeholder model id(s) set to NULL"
+                " (source transcript gone)\n".format(footer["models_cleared"])
+            )
         out(
             "  re-marked:     {0} turn(s) assigned a system:* kind\n".format(
                 footer["remarked"]

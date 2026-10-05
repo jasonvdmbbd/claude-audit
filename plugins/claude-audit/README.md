@@ -1199,6 +1199,21 @@ an `@<date>` suffix that normalization strips (see below); and the Batch
 API's 50%-off rate isn't modeled, since audit traffic is interactive rather
 than batched.
 
+**A derived third map, LiteLLM (calibrated), is a calibration, not a rate
+card.** `PRICING.providers.litellm` is built at load from the `vertex_ai`
+map: every model's Vertex GLOBAL rates (all five components) are multiplied
+by an empirical factor from `LITELLM_CALIBRATION.multipliers` and rounded to
+4 decimals, so a later edit to the Vertex table flows straight through. The
+factors were fitted on 2026-10-05 against real LiteLLM billing for
+`/workspaces/JASON`, 23 Sep – 5 Oct 2026 (real $378.74 vs. the page's
+Vertex-global estimate of $244.35): opus-4-6 ×1.517, opus-4-8 ×1.737,
+sonnet-4-6 ×2.007, haiku-4-5 ×2.25 (tiny sample), and the blended ×1.55 for
+every other model. LiteLLM's bill matched no single structural explanation
+(regional premium, cache-rate differences), hence a fit rather than a price
+list. It has no endpoint toggle, can seed a Custom table, and the rates modal
+shows its provenance (date, workspace, real-vs-estimated totals, the
+per-model multipliers and the caveat).
+
 **Model-id matching is prefix-based, not exact, so a dated or region-qualified
 id still resolves.** `normModel()` lower-cases an id and strips the parts
 that vary without changing the price — a Vertex `@YYYYMMDD` version suffix, a
@@ -1240,6 +1255,16 @@ figure on the page: a warning chip names each unpriced model and how many
 tokens it accounts for before any total is read. The same rule holds for an
 individual turn's or agent's cost tooltip elsewhere in the viewer, which
 shows nothing rather than "$0" when its model isn't in the active table.
+
+**Machinery rows are not "unpriced models".** A row whose model is
+`<synthetic>` (the CLI's placeholder for harness bookkeeping), empty, NULL or
+`(no model recorded)` has no model call to price. `isMachineryModel()` makes
+`rateFor()` return nothing for it, `addGroup()` counts it apart
+(`machineryTokens` / `machineryRows`, not `unpriced`), and the Dashboard shows
+a neutral dim line ("N machinery rows (X tokens) have no model recorded and
+are not priced") instead of the red chip. The By-model section folds these
+into one `(no model · machinery)` row, sorted last with a dim "—" cost. They
+are still excluded from every cost sum, never counted as $0.
 
 **The est.-only caveat, for subscription users especially.** The Dashboard's
 pricing bar, every cost tooltip (`costTip()`), and the rates modal all state
